@@ -1,4 +1,3 @@
 # aurora_stratospheric_probe
-magnitometer calibration script: https://github.com/Iaroslav-Baskov/aurora_magnitometer_calibrator
-accelerometer, gyroscope and magnitometer temperature offsets calibrate script:
+calibration scrips: [https://github.com/Iaroslav-Baskov/aurora_magnitometer_calibrator](https://github.com/Iaroslav-Baskov/aurora_sensors_calibration)
 flight observation web interface:https://github.com/Iaroslav-Baskov/Baloon_simulation
