@@ -36,18 +36,18 @@ Adafruit_AHTX0 aht;
 TinyGPSPlus gps;
 
 const char* labels[]={
-"now[ms]","UT[s]",
-"AHT_tmp[C]","AHT_hum",
-"BMP_temp[C]","BMP_pres",
-"gx","gy","gz",
-"ax","ay","az",
-"gtemp",
-"magx","magy","magz",
-"volt",
-"pm1_0","pm2_5","pm10_0",
-"p03um","p05um","p10um",
-"lat","lon","altitude",
-  };
+  "now[ms]","UT[s]",
+  "AHT_tmp[C]","AHT_hum",
+  "BMP_temp[C]","BMP_pres",
+  "gx","gy","gz",
+  "ax","ay","az",
+  "gtemp",
+  "magx","magy","magz",
+  "volt",
+  "pm1_0","pm2_5","pm10_0",
+  "p03um","p05um","p10um",
+  "lat","lon","altitude",
+};
 
 
 struct float3d{
@@ -81,10 +81,14 @@ struct SystemInfo {
 struct sensor1d{
   float offset;
   float scale;
+  float tempOffset;
+  float t0;
 };
 struct sensor3d{
   float3d offset;
   float3d scale;
+  float3d tempOffset;
+  float t0;
 };
 struct calibrationInfo{
   sensor1d AHT_temp, AHT_hum;
@@ -129,7 +133,41 @@ unsigned int timeOnAir_ms(uint8_t sf, float bw, uint8_t cr, int len, bool header
   return (unsigned int)ceil(tOnAir); 
 }
 
-void getMag(float3d &output) {
+float calibrate(sensor1d dataset, float value,float t=-300){
+  if(t!=-300)return (value-dataset.offset-dataset.tempOffset*(t-dataset.t0))*dataset.scale;
+  return (value-dataset.offset)*dataset.scale;
+}
+int calibrate(sensor1d dataset, int value,float t=-300){
+  if(t!=-300)return (int)((value-dataset.offset-dataset.tempOffset*(t-dataset.t0))*dataset.scale);
+  return (int)((value-dataset.offset)*dataset.scale);
+}
+float3d calibrate(sensor3d dataset, float3d value,float t=-300){
+  float3d v;
+  if (t!=-300){
+    v.x=(value.x-dataset.offset.x-dataset.tempOffset.x*(t-dataset.t0))*dataset.scale.x;
+    v.y=(value.y-dataset.offset.y-dataset.tempOffset.y*(t-dataset.t0))*dataset.scale.y;
+    v.z=(value.z-dataset.offset.z-dataset.tempOffset.z*(t-dataset.t0))*dataset.scale.z;}
+  else{
+    v.x=(value.x-dataset.offset.x)*dataset.scale.x;
+    v.y=(value.y-dataset.offset.y)*dataset.scale.y;
+    v.z=(value.z-dataset.offset.z)*dataset.scale.z;
+  }
+  return v;
+}
+float3d calibrate(sensor3d dataset, int16_t3d value,float t=-300){
+  float3d v;
+  if (t!=-300){
+    v.x=((float)value.x-dataset.offset.x-dataset.tempOffset.x*(t-dataset.t0))*dataset.scale.x;
+    v.y=((float)value.y-dataset.offset.y-dataset.tempOffset.y*(t-dataset.t0))*dataset.scale.y;
+    v.z=((float)value.z-dataset.offset.z-dataset.tempOffset.z*(t-dataset.t0))*dataset.scale.z;}
+  else{
+    v.x=((float)value.x-dataset.offset.x)*dataset.scale.x;
+    v.y=((float)value.y-dataset.offset.y)*dataset.scale.y;
+    v.z=((float)value.z-dataset.offset.z)*dataset.scale.z;
+  }
+  return v;
+}
+void getMag(float3d &output,sensor3d calibrator,float t) {
   if(check.mag.OK){
     check.mag.last = millis();
     int16_t3d result;
@@ -143,7 +181,7 @@ void getMag(float3d &output) {
       result.x = Wire.read() | (Wire.read() << 8);
       result.y = Wire.read() | (Wire.read() << 8);
       result.z = Wire.read() | (Wire.read() << 8);
-      output=calibrate(calibrator.mag,result);
+      output=calibrate(calibrator,result,t=t);
    }
   }
 }
@@ -376,26 +414,6 @@ void sendSMS(Stream &serial) {
   }else smsConnect();
 }
 
-float calibrate(sensor1d dataset, float value){
-  return (value-dataset.offset)*dataset.scale;
-}
-int calibrate(sensor1d dataset, int value){
-  return (value-dataset.offset)*dataset.scale;
-}
-float3d calibrate(sensor3d dataset, float3d value){
-  float3d v;
-  v.x=(value.x-dataset.offset.x)*dataset.scale.x;
-  v.y=(value.y-dataset.offset.y)*dataset.scale.y;
-  v.z=(value.z-dataset.offset.z)*dataset.scale.z;
-  return v;
-}
-float3d calibrate(sensor3d dataset, int16_t3d value){
-  float3d v;
-  v.x=((float)value.x-dataset.offset.x)*dataset.scale.x;
-  v.y=((float)value.y-dataset.offset.y)*dataset.scale.y;
-  v.z=((float)value.z-dataset.offset.z)*dataset.scale.z;
-  return v;
-}
 void setup() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
@@ -453,7 +471,7 @@ void loop() {
       data.gyro.y = sensor.getGyroY();
       data.gyro.z = sensor.getGyroZ();
   
-      data.gtemp = sensor.getTemperature();
+      data.gtemp = calibrate(calibrator.gtemp,sensor.getTemperature());
       check.gyro.last=millis();}
   }
   else if (millis()-check.gyro.last>check.gyro.timeout){
@@ -476,7 +494,7 @@ void loop() {
     bmpConnect();
   }
   if(check.mag.OK){
-    getMag(data.mag);}
+    getMag(data.mag,calibrator.mag,data.gtemp);}
   else if (millis()-check.mag.last>check.mag.timeout){
     magnConnect();
   }
