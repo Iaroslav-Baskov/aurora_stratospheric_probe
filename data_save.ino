@@ -18,7 +18,7 @@
 #define RXD2      16
 #define TXD2      17
 
-#define SD_CS     5
+#define SD_CS     33
 #define SCK_PIN   18
 #define MISO_PIN  19
 #define MOSI_PIN  23
@@ -137,9 +137,9 @@ float calibrate(sensor1d dataset, float value,float t=-300){
   if(t!=-300)return (value-dataset.offset-dataset.tempOffset*(t-dataset.t0))*dataset.scale;
   return (value-dataset.offset)*dataset.scale;
 }
-int calibrate(sensor1d dataset, int value,float t=-300){
+float calibrate(sensor1d dataset, int value,float t=-300){
   if(t!=-300)return (int)((value-dataset.offset-dataset.tempOffset*(t-dataset.t0))*dataset.scale);
-  return (int)((value-dataset.offset)*dataset.scale);
+  return ((value-dataset.offset)*dataset.scale);
 }
 float3d calibrate(sensor3d dataset, float3d value,float t=-300){
   float3d v;
@@ -168,7 +168,6 @@ float3d calibrate(sensor3d dataset, int16_t3d value,float t=-300){
   return v;
 }
 void getMag(float3d &output,sensor3d calibrator,float t) {
-  if(check.mag.OK){
     check.mag.last = millis();
     int16_t3d result;
   
@@ -183,17 +182,16 @@ void getMag(float3d &output,sensor3d calibrator,float t) {
       result.z = Wire.read() | (Wire.read() << 8);
       output=calibrate(calibrator,result,t=t);
    }
-  }
 }
 void checkI2CDevices() {
-    check.gyro.OK = i2cDevicePresent(0x68);
-    if(check.gyro.OK)check.gyro.last=millis();
-    check.BMP.OK = i2cDevicePresent(0x76);
-    if(check.BMP.OK)check.BMP.last=millis();
-    check.AHT.OK = i2cDevicePresent(0x38);
-    if(check.AHT.OK)check.AHT.last=millis();
-    check.mag.OK = i2cDevicePresent(QMC5883L_ADDRESS);
-    if(check.mag.OK)check.mag.last=millis();
+    check.gyro.OK = check.gyro.OK && i2cDevicePresent(0x68);
+    Serial.print(check.gyro.OK);
+    check.BMP.OK = check.BMP.OK && i2cDevicePresent(0x76);
+    Serial.print(check.BMP.OK);
+    check.AHT.OK =check.AHT.OK && i2cDevicePresent(0x38);
+    Serial.print(check.AHT.OK);
+    check.mag.OK =check.mag.OK && i2cDevicePresent(QMC5883L_ADDRESS);
+    Serial.println(check.mag.OK);
 }
 
 bool i2cDevicePresent(uint8_t address) {
@@ -274,10 +272,8 @@ void sdConnect(){
   check.SD.OK=SD.begin(SD_CS);
   if(check.SD.OK){
     check.SD.last=millis();
-    File file = SD.open("/data.csv");
-    if (!file) {
-      file.close();
-      file = SD.open("/data.csv");
+    if (!SD.exists("/data.csv")) {
+      File file = SD.open("/data.csv",FILE_WRITE);
       if(file){
         for(int i=0;i<sizeof(labels)/sizeof(labels[0]);i++){
           file.print(labels[i]);
@@ -305,35 +301,45 @@ void LoRaConnect(){
 }
 void ahtConnect(){
   Serial.println("aht connect");
-  check.AHT.OK=aht.begin();
-  if(check.AHT.OK)check.AHT.last=millis();
+  check.AHT.last=millis();
+  if(i2cDevicePresent(0x38))check.AHT.OK=aht.begin();
+  else Serial.println("aht not found");
 }
 void bmpConnect(){
   Serial.println("bmp connect");
-  check.BMP.OK=bmp280.begin();
-  if(check.BMP.OK)check.BMP.last=millis();
+  check.BMP.last=millis();
+  if(i2cDevicePresent(0x76))check.BMP.OK=bmp280.begin();
+  else Serial.println("bmp not found");
 }
 void accelConnect(){
-  
   Serial.println("accel connect");
-  check.gyro.OK=sensor.wakeup();
-  if(check.gyro.OK) check.gyro.last=millis();
+  check.gyro.last=millis();
+  if(i2cDevicePresent(0x68)){
+    check.gyro.OK=sensor.wakeup();
+    if(check.gyro.OK) {
+      sensor.setAccelSensitivity(0);  //  2g
+      sensor.setGyroSensitivity(0);   //  250 degrees/s
+      sensor.setThrottle();
+    }
+  }else Serial.println("accel not found");
 }
 void magnConnect(){
   Serial.println("magn connect");
-  Wire.beginTransmission(QMC5883L_ADDRESS);
-  Wire.write(0x09);
-  Wire.write(0b00011101); // OSR=512, 8G, 200Hz, continuous
-  Wire.endTransmission();
-
-  Wire.beginTransmission(QMC5883L_ADDRESS);
-  Wire.write(0x0B);
-  Wire.write(0x01);
-  Wire.endTransmission();
-
-  delay(50);
+  check.mag.last=millis();
+  
   check.mag.OK = i2cDevicePresent(QMC5883L_ADDRESS);
-  if(check.mag.OK)check.mag.last=millis();
+  if(check.mag.OK){
+    Wire.beginTransmission(QMC5883L_ADDRESS);
+    Wire.write(0x09);
+    Wire.write(0b00011101); // OSR=512, 8G, 200Hz, continuous
+    Wire.endTransmission();
+  
+    Wire.beginTransmission(QMC5883L_ADDRESS);
+    Wire.write(0x0B);
+    Wire.write(0x01);
+    Wire.endTransmission();
+  }
+  else Serial.println("magn no found");
 }
 void startI2CDevices(){
   delay(500);
@@ -351,7 +357,6 @@ void pmsConnect(){
   Serial.println("pms connect");
 }
 void gpsConnect(){
-  
   Serial.println("gps connect");
   Serial1.end();
   delay(500);
@@ -391,9 +396,9 @@ void smsConnect(){
 bool checkSMS(Stream &serial){
   serial.println("AT");
   delay(100);
+  check.SMS.last=millis();
   if(serial.available()>=3){
     if(serial.read()=='O' && serial.read()=='K' && serial.read()=='\n'){
-      check.SMS.last=millis();
       check.SMS.OK=true;
       return true;}
   }
@@ -411,7 +416,7 @@ void sendSMS(Stream &serial) {
       dataToJson(data,row,sizeof(row));
       serial.print(row);
       serial.write(26);
-  }else smsConnect();
+  }else if(millis()-check.SMS.last>check.SMS.timeout)smsConnect();
 }
 
 void setup() {
@@ -427,6 +432,8 @@ void setup() {
   pinMode(SD_CS, OUTPUT);
 
   LoRa.setPins(CS_PIN, RST, DIO0);
+  
+  check.LoRa.timeout=timeOnAir_ms(12, 62.5E3, 8, sizeof(payload), true, true);
   check.SMS.timeout=5000;
   check.GPS.timeout=5000;
   check.pms.timeout=5000;
@@ -434,14 +441,37 @@ void setup() {
   check.BMP.timeout=1000;
   check.gyro.timeout=1000;
   check.mag.timeout=1000;
-
+  
   calibrator.mag.offset.x=0;
   calibrator.mag.offset.y=0;
   calibrator.mag.offset.z=0;
+  
+  calibrator.gyro.offset.x=0;
+  calibrator.gyro.offset.y=0;
+  calibrator.gyro.offset.z=0;
+
+  calibrator.mag.tempOffset.x=0;
+  calibrator.mag.tempOffset.y=0;
+  calibrator.mag.tempOffset.z=0;
+  
+  calibrator.gyro.tempOffset.x=0;
+  calibrator.gyro.tempOffset.y=0;
+  calibrator.gyro.tempOffset.z=0;
+  
   calibrator.mag.scale.x=1.5;
   calibrator.mag.scale.y=1.5;
   calibrator.mag.scale.z=1.5;
-  loraInterval=timeOnAir_ms(12, 62.5E3, 8, sizeof(payload), true, true);
+  
+  calibrator.gyro.scale.x=1;
+  calibrator.gyro.scale.y=1;
+  calibrator.gyro.scale.z=1;
+
+  calibrator.gtemp.offset=-36.53*340;
+  calibrator.gtemp.scale=1/340;
+  
+  calibrator.volt.scale=3.10/4095;
+  //calibrator.volt.offset=-0.97*4095/3.10;
+  
   
   digitalWrite(CS_PIN, HIGH);
   digitalWrite(SD_CS, HIGH);
@@ -462,7 +492,7 @@ void loop() {
     startI2CDevices();
   }
   if(check.gyro.OK){
-    if(sensor.read()){
+      sensor.read();
       data.accel.x = sensor.getAccelX();
       data.accel.y = sensor.getAccelY();
       data.accel.z = sensor.getAccelZ();
@@ -472,7 +502,7 @@ void loop() {
       data.gyro.z = sensor.getGyroZ();
   
       data.gtemp = calibrate(calibrator.gtemp,sensor.getTemperature());
-      check.gyro.last=millis();}
+      check.gyro.last=millis();
   }
   else if (millis()-check.gyro.last>check.gyro.timeout){
     accelConnect();
@@ -499,7 +529,7 @@ void loop() {
     magnConnect();
   }
 
-  data.volt =analogRead(TEST_PIN)*3.10/4095+0.97;
+  data.volt =calibrate(calibrator.volt,analogRead(TEST_PIN));
   
   
   if (data.gtemp < 40) { 
@@ -526,11 +556,11 @@ void loop() {
     }
   }else sdConnect();
 
-  if (millis() - check.SMS.last> smsInterval) {
+  if (millis() - check.SMS.last> check.SMS.timeout) {
     sendSMS(Serial2);
   }
 
-  if (millis() - check.LoRa.last > loraInterval) {
+  if (millis() - check.LoRa.last > check.LoRa.timeout) {
     generatePayload();
     LoRa.beginPacket();
     LoRa.write(payload, 1 + sizeof(SensorData) + 1);
