@@ -28,8 +28,6 @@
 
 #define QMC5883L_ADDRESS 0x0D
 
-#define SCALE_FACTOR 1.5
-
 GY521 sensor(0x68);
 BMP280 bmp280;
 Adafruit_AHTX0 aht;
@@ -55,6 +53,7 @@ struct float3d{
 struct int16_t3d{
   int16_t x,y,z;};
   
+
 struct SensorData {
   unsigned long now;
   unsigned int UT_seconds;
@@ -69,15 +68,21 @@ struct SensorData {
   unsigned int p03um, p05um, p10um;
   float lon, lat, altitude;
 };
+
 struct device{
   bool OK;
   unsigned long last;
-  unsigned long last_alive;
   unsigned long timeout;
+  String name;
 };
 struct SystemInfo {
   device SD,LoRa,SMS,pms,AHT,BMP,gyro,mag,GPS;
 };
+
+
+
+
+
 struct sensor1d{
   float offset;
   float scale;
@@ -105,25 +110,13 @@ calibrationInfo calibrator;
 SystemInfo check;
 
 char row[2048];
-int unitime;
 uint8_t payload[sizeof(SensorData) + 2];
 uint8_t pmsBuffer[32];
-
-
-const unsigned long smsInterval = 60000;
-unsigned long loraInterval=0;
 
 const char* number = "+359892777567";
 
 int power = 0;
 
-void generatePayload() {
-  payload[0] = 0xAA;  // стартовый байт
-
-  memcpy(&payload[1], &data, sizeof(SensorData));
-
-  payload[1 + sizeof(SensorData)] = 0xBB;  // конечный байт
-}
 
 unsigned int timeOnAir_ms(uint8_t sf, float bw, uint8_t cr, int len, bool header, bool crc) { // calculate time-on-air in milliseconds for LoRa packet 
   double ts = (double)(1 << sf) / bw * 1000; // symbol duration in ms 
@@ -131,6 +124,13 @@ unsigned int timeOnAir_ms(uint8_t sf, float bw, uint8_t cr, int len, bool header
   double nPayload = 8 + std::max( ceil((8 * pl - 4 * sf + 28 + 16 * crc - 20) / (double)(4 * (sf - 2))) * (cr + 4), 0.0 ); 
   double tOnAir = (12.25 + nPayload) * ts; 
   return (unsigned int)ceil(tOnAir); 
+}
+void generatePayload() {
+  payload[0] = 0xAA;  // стартовый байт
+
+  memcpy(&payload[1], &data, sizeof(SensorData));
+
+  payload[1 + sizeof(SensorData)] = 0xBB;  // конечный байт
 }
 
 float calibrate(sensor1d dataset, float value,float t=-300){
@@ -186,7 +186,7 @@ void getMag(float3d &output,sensor3d calibrator,float t) {
 void checkI2CDevices() {
     check.gyro.OK = check.gyro.OK && i2cDevicePresent(0x68);
     Serial.print(check.gyro.OK);
-    check.BMP.OK = check.BMP.OK && i2cDevicePresent(0x76);
+    check.BMP.OK = check.BMP.OK && i2cDevicePresent(0x77);
     Serial.print(check.BMP.OK);
     check.AHT.OK =check.AHT.OK && i2cDevicePresent(0x38);
     Serial.print(check.AHT.OK);
@@ -216,12 +216,6 @@ bool readPMSFrame(Stream &serial, uint8_t *buffer) { // Чтение 32 байт
         return true;
     }
   }
-  data.pm1_0 = 0;
-  data.pm2_5 = 0;
-  data.pm10_0 =0;
-  data.p03um = 0;
-  data.p05um = 0;
-  data.p10um = 0; 
   if(millis()-check.pms.last>check.pms.timeout){
     
     check.pms.last=millis();
@@ -308,7 +302,7 @@ void ahtConnect(){
 void bmpConnect(){
   Serial.println("bmp connect");
   check.BMP.last=millis();
-  if(i2cDevicePresent(0x76))check.BMP.OK=bmp280.begin();
+  if(i2cDevicePresent(0x77))check.BMP.OK=bmp280.begin()==0;
   else Serial.println("bmp not found");
 }
 void accelConnect(){
