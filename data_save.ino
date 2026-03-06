@@ -38,10 +38,10 @@ const char* labels[]={
   "AHT_tmp[C]","AHT_hum",
   "BMP_temp[C]","BMP_pres",
   "gx","gy","gz",
-  "ax","ay","az",
-  "gtemp",
-  "magx","magy","magz",
-  "volt",
+  "ax[m/s2]","ay[m/s2]","az[m/s2]",
+  "gtemp[C]",
+  "magx[G]","magy[G]","magz[G]",
+  "voltage",
   "pm1_0","pm2_5","pm10_0",
   "p03um","p05um","p10um",
   "lat","lon","altitude",
@@ -78,11 +78,6 @@ struct device{
 struct SystemInfo {
   device SD,LoRa,SMS,pms,AHT,BMP,gyro,mag,GPS;
 };
-
-
-
-
-
 struct sensor1d{
   float offset;
   float scale;
@@ -96,11 +91,9 @@ struct sensor3d{
   float t0;
 };
 struct calibrationInfo{
-  sensor1d AHT_temp, AHT_hum;
-  sensor1d BMP_temp, BMP_pres;
   sensor1d volt;
   sensor1d gtemp;
-  sensor1d accel;
+  sensor3d accel;
   sensor3d gyro;
   sensor3d mag;
 };
@@ -183,6 +176,10 @@ void getMag(float3d &output,sensor3d calibrator,float t) {
       output=calibrate(calibrator,result,t=t);
    }
 }
+bool i2cDevicePresent(uint8_t address) {
+    Wire.beginTransmission(address);
+    return (Wire.endTransmission() == 0);
+}
 void checkI2CDevices() {
     check.gyro.OK = check.gyro.OK && i2cDevicePresent(0x68);
     Serial.print(check.gyro.OK);
@@ -194,10 +191,6 @@ void checkI2CDevices() {
     Serial.println(check.mag.OK);
 }
 
-bool i2cDevicePresent(uint8_t address) {
-    Wire.beginTransmission(address);
-    return (Wire.endTransmission() == 0);
-}
 bool readPMSFrame(Stream &serial, uint8_t *buffer) { // Чтение 32 байт из PMS 
   if (serial.available() >=2) { 
     if (serial.read() == 0x42 && serial.read() == 0x4D) {
@@ -227,7 +220,7 @@ bool readPMSFrame(Stream &serial, uint8_t *buffer) { // Чтение 32 байт
 void dataToJson(SensorData data,char buffer[],int len){
   int i=0;
   snprintf(buffer, len,
-    "{%s:%d,%s:%d,%s:%.2f,%s:%.2f,%s:%.2f,%s:%.0f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.2f,%s:%.2f,%s:%.2f,%s:%.2f,%s:%.4f,%s:%d,%s:%d,%s:%d,%s:%d,%s:%d,%s:%d,%s:%.9f,%s:%.9f,%s:%.0f}\n",
+    "{%s:%d,%s:%d,%s:%.2f,%s:%.2f,%s:%.2f,%s:%.0f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.4f,%s:%d,%s:%d,%s:%d,%s:%d,%s:%d,%s:%d,%s:%.9f,%s:%.9f,%s:%.0f}\n",
     labels[i++],data.now,labels[i++],data.UT_seconds,
     labels[i++],data.AHT_temp,labels[i++],data.AHT_hum,
     labels[i++],data.BMP_temp,labels[i++],data.BMP_pres,
@@ -245,7 +238,7 @@ void dataToJson(SensorData data,char buffer[],int len){
 }
 void dataToCsv(SensorData data,char buffer[],int len){
   snprintf(buffer, len,
-    "%d,%d,%.2f,%.2f,%.2f,%.0f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%.4f,%d,%d,%d,%d,%d,%d,%.9f,%.9f,%.0f\n",
+    "%d,%d,%.2f,%.2f,%.2f,%.0f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%d,%d,%d,%d,%d,%d,%.9f,%.9f,%.0f\n",
     data.now,data.UT_seconds,
     data.AHT_temp,data.AHT_hum,
     data.BMP_temp,data.BMP_pres,
@@ -436,35 +429,31 @@ void setup() {
   check.gyro.timeout=1000;
   check.mag.timeout=1000;
   
-  calibrator.mag.offset.x=0;
-  calibrator.mag.offset.y=0;
-  calibrator.mag.offset.z=0;
-  
-  calibrator.gyro.offset.x=0;
-  calibrator.gyro.offset.y=0;
-  calibrator.gyro.offset.z=0;
+  calibrator.gyro.tempOffset.x=-0.021586792358359117;
+  calibrator.gyro.offset.x=2.0293925221537843;
+  calibrator.gyro.tempOffset.y=-0.0203030523388205;
+  calibrator.gyro.offset.y=2.0367279043462965;
+  calibrator.gyro.tempOffset.z=-0.005832454539831707;
+  calibrator.gyro.offset.z=-0.2910172807975372;
+  calibrator.accel.offset.x=0.03764483705436618;
+  calibrator.accel.scale.x=9.89667167880515;
+  calibrator.accel.offset.y=0.0039877343303261386;
+  calibrator.accel.scale.y=9.91839443251234;
+  calibrator.accel.offset.z=-0.0007502589765589077;
+  calibrator.accel.scale.z=9.620605996593481;
+  calibrator.mag.offset.x=499.22560443025856;
+  calibrator.mag.scale.x=0.00033468981790177587;
+  calibrator.mag.offset.y=406.10800404767446;
+  calibrator.mag.scale.y=0.00032792114858669303;
+  calibrator.mag.offset.z=254.62126909439348;
+  calibrator.mag.scale.z=0.0003375361890145562;
+  calibrator.gtemp.offset=21.892719725589476;
+  calibrator.gtemp.scale=0.8899545931264473;
 
-  calibrator.mag.tempOffset.x=0;
-  calibrator.mag.tempOffset.y=0;
-  calibrator.mag.tempOffset.z=0;
-  
-  calibrator.gyro.tempOffset.x=0;
-  calibrator.gyro.tempOffset.y=0;
-  calibrator.gyro.tempOffset.z=0;
-  
-  calibrator.mag.scale.x=1.5;
-  calibrator.mag.scale.y=1.5;
-  calibrator.mag.scale.z=1.5;
-  
-  calibrator.gyro.scale.x=1;
-  calibrator.gyro.scale.y=1;
-  calibrator.gyro.scale.z=1;
 
-  calibrator.gtemp.offset=-36.53*340;
-  calibrator.gtemp.scale=1/340;
   
   calibrator.volt.scale=3.10/4095;
-  //calibrator.volt.offset=-0.97*4095/3.10;
+  calibrator.volt.offset=-0.97*4095/3.10;
   
   
   digitalWrite(CS_PIN, HIGH);
