@@ -27,19 +27,19 @@ struct SensorData {
   float lon, lat, altitude;
 };
 
-  String labels[] ={
-"now[ms]","UT[s]",
-"AHT_tmp[C]","AHT_hum",
-"BMP_temp[C]","BMP_pres",
-"gx","gy","gz",
-"ax","ay","az",
-"gtemp",
-"magx","magy","magz",
-"volt",
-"pm1_0","pm2_5","pm10_0",
-"p03um","p05um","p10um",
-"lat","lon","altitude",
-  };
+const char* labels[]={
+  "now[ms]","UT[s]",
+  "AHT_tmp[C]","AHT_hum",
+  "BMP_temp[C]","BMP_pres",
+  "gx","gy","gz",
+  "ax[m/s2]","ay[m/s2]","az[m/s2]",
+  "gtemp[C]",
+  "magx[G]","magy[G]","magz[G]",
+  "voltage",
+  "pm1_0","pm2_5","pm10_0",
+  "p03um","p05um","p10um",
+  "lat","lon","altitude",
+};
 int normal_size;
 SensorData data;
 int rssi;
@@ -102,7 +102,7 @@ void loop() {
 void dataToJson(SensorData data,char buffer[],int len){
   int i=0;
   snprintf(buffer, len,
-    "{%s:%d,%s:%d,%s:%.2f,%s:%.2f,%s:%.2f,%s:%.0f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.2f,%s:%.2f,%s:%.2f,%s:%.2f,%s:%.4f,%s:%d,%s:%d,%s:%d,%s:%d,%s:%d,%s:%d,%s:%.9f,%s:%.9f,%s:%.0f}\n",
+    "{%s:%d,%s:%d,%s:%.2f,%s:%.2f,%s:%.2f,%s:%.0f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.4f,%s:%d,%s:%d,%s:%d,%s:%d,%s:%d,%s:%d,%s:%.9f,%s:%.9f,%s:%.0f}\n",
     labels[i++],data.now,labels[i++],data.UT_seconds,
     labels[i++],data.AHT_temp,labels[i++],data.AHT_hum,
     labels[i++],data.BMP_temp,labels[i++],data.BMP_pres,
@@ -117,6 +117,24 @@ void dataToJson(SensorData data,char buffer[],int len){
     labels[i++],data.lon,
     labels[i++],data.altitude,
     labels[i++]);
+}
+void dataToCsv(SensorData data,char buffer[],int len){
+  snprintf(buffer, len,
+    "%d,%d,%.2f,%.2f,%.2f,%.0f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%d,%d,%d,%d,%d,%d,%.9f,%.9f,%.0f\n",
+    data.now,data.UT_seconds,
+    data.AHT_temp,data.AHT_hum,
+    data.BMP_temp,data.BMP_pres,
+    data.gyro.x,data.gyro.y,data.gyro.z,
+    data.accel.x,data.accel.y,data.accel.z,
+    data.gtemp,
+    data.mag.x,data.mag.y,data.mag.z,
+    data.volt,
+    data.pm1_0, data.pm2_5, data.pm10_0,
+    data.p03um, data.p05um, data.p10um,
+    data.lat,
+    data.lon,
+    data.altitude
+  );
 }
 void generateErrorRow(char buffer[],int len,std::vector<unsigned char> payload, int normal_size,int rssi,float snr){
   int i=0;
