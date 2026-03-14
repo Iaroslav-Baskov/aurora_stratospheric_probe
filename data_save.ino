@@ -26,7 +26,7 @@
 #define HOT_PIN   32
 #define TEST_PIN  35
 
-#define QMC5883L_ADDRESS 0x0D
+#define QMC5883L_ADDRESS 0x1E
 
 GY521 sensor(0x68);
 BMP280 bmp280;
@@ -44,7 +44,7 @@ const char* labels[]={
   "voltage",
   "pm1_0","pm2_5","pm10_0",
   "p03um","p05um","p10um",
-  "lat","lon","altitude",
+  "lat","lon","altitude","2G",
 };
 
 
@@ -53,8 +53,8 @@ struct float3d{
 struct int16_t3d{
   int16_t x,y,z;};
   
-
 struct SensorData {
+  float lon, lat, altitude;
   unsigned long now;
   unsigned int UT_seconds;
   float AHT_temp, AHT_hum;
@@ -66,32 +66,41 @@ struct SensorData {
   float volt;
   unsigned int pm1_0, pm2_5, pm10_0;
   unsigned int p03um, p05um, p10um;
-  float lon, lat, altitude;
+  int q2G;
 };
 
 struct device{
-  bool OK;
-  unsigned long last;
-  unsigned long timeout;
-  String name;
+  bool OK=false;
+  unsigned long last=0;
+  unsigned long timeout=1000;
+};
+struct heatDevice{
+  bool isOn=false;
+  unsigned long last=0;
+  float targetTemp=0;
+  float tempThreshold=0;
+  float minVoltage=0;
+  float voltThreshold;
 };
 struct SystemInfo {
   device SD,LoRa,SMS,pms,AHT,BMP,gyro,mag,GPS;
+  heatDevice termo;
 };
 struct sensor1d{
-  float offset;
-  float scale;
-  float tempOffset;
-  float t0;
+  float offset=0;
+  float scale=1;
+  float tempOffset=0;
+  float t0=0;
 };
 struct sensor3d{
-  float3d offset;
-  float3d scale;
-  float3d tempOffset;
-  float t0;
+  float3d offset={0,0,0};
+  float3d scale={1,1,1};
+  float3d tempOffset={0,0,0};
+  float t0=0;
 };
 struct calibrationInfo{
   sensor1d volt;
+  sensor1d q2G;
   sensor1d gtemp;
   sensor3d accel;
   sensor3d gyro;
@@ -108,9 +117,6 @@ uint8_t pmsBuffer[32];
 
 const char* number = "+359892777567";
 
-int power = 0;
-
-
 unsigned int timeOnAir_ms(uint8_t sf, float bw, uint8_t cr, int len, bool header, bool crc) { // calculate time-on-air in milliseconds for LoRa packet 
   double ts = (double)(1 << sf) / bw * 1000; // symbol duration in ms 
   double pl = len + (header ? 0 : 4); 
@@ -118,7 +124,7 @@ unsigned int timeOnAir_ms(uint8_t sf, float bw, uint8_t cr, int len, bool header
   double tOnAir = (12.25 + nPayload) * ts; 
   return (unsigned int)ceil(tOnAir); 
 }
-void generatePayload() {
+void generatePayload(uint8_t *payload) {
   payload[0] = 0xAA;  // стартовый байт
 
   memcpy(&payload[1], &data, sizeof(SensorData));
@@ -182,13 +188,9 @@ bool i2cDevicePresent(uint8_t address) {
 }
 void checkI2CDevices() {
     check.gyro.OK = check.gyro.OK && i2cDevicePresent(0x68);
-    Serial.print(check.gyro.OK);
     check.BMP.OK = check.BMP.OK && i2cDevicePresent(0x77);
-    Serial.print(check.BMP.OK);
     check.AHT.OK =check.AHT.OK && i2cDevicePresent(0x38);
-    Serial.print(check.AHT.OK);
     check.mag.OK =check.mag.OK && i2cDevicePresent(QMC5883L_ADDRESS);
-    Serial.println(check.mag.OK);
 }
 
 bool readPMSFrame(Stream &serial, uint8_t *buffer) { // Чтение 32 байт из PMS 
@@ -220,7 +222,11 @@ bool readPMSFrame(Stream &serial, uint8_t *buffer) { // Чтение 32 байт
 void dataToJson(SensorData data,char buffer[],int len){
   int i=0;
   snprintf(buffer, len,
-    "{%s:%d,%s:%d,%s:%.2f,%s:%.2f,%s:%.2f,%s:%.0f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.3f,%s:%.4f,%s:%d,%s:%d,%s:%d,%s:%d,%s:%d,%s:%d,%s:%.9f,%s:%.9f,%s:%.0f}\n",
+    "{\"%s\":%d,\"%s\":%d,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.0f,"
+    "\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,"
+    "\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%d,"
+    "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%.9f,\"%s\":%.9f,"
+    "\"%s\":%.0f,\"%s\":%d}\n",
     labels[i++],data.now,labels[i++],data.UT_seconds,
     labels[i++],data.AHT_temp,labels[i++],data.AHT_hum,
     labels[i++],data.BMP_temp,labels[i++],data.BMP_pres,
@@ -234,11 +240,12 @@ void dataToJson(SensorData data,char buffer[],int len){
     labels[i++],data.lat,
     labels[i++],data.lon,
     labels[i++],data.altitude,
+    labels[i++],data.q2G,
     labels[i++]);
 }
 void dataToCsv(SensorData data,char buffer[],int len){
   snprintf(buffer, len,
-    "%d,%d,%.2f,%.2f,%.2f,%.0f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%d,%d,%d,%d,%d,%d,%.9f,%.9f,%.0f\n",
+    "%d,%d,%.2f,%.2f,%.2f,%.0f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%d,%d,%d,%d,%d,%d,%.9f,%.9f,%.0f,%d\n",
     data.now,data.UT_seconds,
     data.AHT_temp,data.AHT_hum,
     data.BMP_temp,data.BMP_pres,
@@ -251,11 +258,13 @@ void dataToCsv(SensorData data,char buffer[],int len){
     data.p03um, data.p05um, data.p10um,
     data.lat,
     data.lon,
-    data.altitude
+    data.altitude,
+    data.q2G
   );
 }
 void sdConnect(){
   Serial.println("sd connect");
+  digitalWrite(SD_CS, LOW);
   check.SD.OK=SD.begin(SD_CS);
   if(check.SD.OK){
     check.SD.last=millis();
@@ -270,6 +279,7 @@ void sdConnect(){
         file.close();}
     }
   }
+  digitalWrite(SD_CS, HIGH);
 }
 
 void LoRaConnect(){
@@ -286,6 +296,23 @@ void LoRaConnect(){
     LoRa.setCodingRate4(8);
     LoRa.setTxPower(20);}
 }
+void LoRaCheck(){
+  uint8_t version = 0;
+  
+  // Start SPI manual transaction
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(SD_CS, HIGH);
+  digitalWrite(CS_PIN, LOW); // Select LoRa
+  
+  // Send 0x42 (Version Register). 
+  // In SPI, the 8th bit is 0 for Read, 1 for Write.
+  SPI.transfer(0x42 & 0x7F); 
+  version = SPI.transfer(0x00); // Read the result
+  
+  digitalWrite(CS_PIN, HIGH); // Deselect LoRa
+  SPI.endTransaction();
+  if(version!=0x12){
+  check.LoRa.OK=false;}}
 void ahtConnect(){
   Serial.println("aht connect");
   check.AHT.last=millis();
@@ -375,35 +402,48 @@ bool readGPSFrame(Stream &serial){
 void smsConnect(){
   Serial.println("sms connect");
   Serial2.end();
-  delay(500);
+  delay(50);
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
   delay(100);
   checkSMS(Serial2);
 }
 bool checkSMS(Stream &serial){
+  while(serial.available())serial.read();
   serial.println("AT");
-  delay(100);
+  delay(50);
   check.SMS.last=millis();
-  if(serial.available()>=3){
-    if(serial.read()=='O' && serial.read()=='K' && serial.read()=='\n'){
+    if(serial.readString().indexOf("OK")!=-1){
       check.SMS.OK=true;
       return true;}
-  }
+  
   check.SMS.OK=false;
   return false;
 }
+int get2gQuality(Stream &serial){
+  while(serial.available())serial.read();
+  serial.println("AT+CSQ");
+  delay(50);
+  String output=serial.readString();
+  int start=output.indexOf(": ");
+  output=output.substring(start+2,start+4);
+  if(output[1]==','){
+    output=output.substring(0,1);
+  }
+  return (int) calibrate(calibrator.q2G,(int)output.toInt());
+}
 void sendSMS(Stream &serial) {
   if(checkSMS(serial)){
+      data.q2G=get2gQuality(serial);
       serial.println("AT+CMGF=1");
-      delay(200);
+      delay(50);
       serial.print("AT+CMGS=\"");
       serial.print(number);
       serial.println("\"");
-      delay(200);
+      delay(50);
       dataToJson(data,row,sizeof(row));
       serial.print(row);
       serial.write(26);
-  }else if(millis()-check.SMS.last>check.SMS.timeout)smsConnect();
+  }else smsConnect();
 }
 
 void setup() {
@@ -419,7 +459,6 @@ void setup() {
   pinMode(SD_CS, OUTPUT);
 
   LoRa.setPins(CS_PIN, RST, DIO0);
-  
   check.LoRa.timeout=timeOnAir_ms(12, 62.5E3, 8, sizeof(payload), true, true);
   check.SMS.timeout=5000;
   check.GPS.timeout=5000;
@@ -450,11 +489,15 @@ void setup() {
   calibrator.gtemp.offset=21.892719725589476;
   calibrator.gtemp.scale=0.8899545931264473;
 
-
-  
   calibrator.volt.scale=3.10/4095;
   calibrator.volt.offset=-0.97*4095/3.10;
   
+  calibrator.q2G.scale=2;
+  calibrator.q2G.offset=113/2;
+  check.termo.targetTemp=30;
+  check.termo.tempThreshold=2;
+  check.termo.minVoltage=3.1;
+  check.termo.voltThreshold=0.2;
   
   digitalWrite(CS_PIN, HIGH);
   digitalWrite(SD_CS, HIGH);
@@ -474,17 +517,20 @@ void loop() {
   if(!(check.AHT.OK || check.BMP.OK || check.gyro.OK || check.mag.OK)){
     startI2CDevices();
   }
+  
   if(check.gyro.OK){
       sensor.read();
       data.accel.x = sensor.getAccelX();
       data.accel.y = sensor.getAccelY();
       data.accel.z = sensor.getAccelZ();
-    
       data.gyro.x = sensor.getGyroX();
       data.gyro.y = sensor.getGyroY();
       data.gyro.z = sensor.getGyroZ();
   
       data.gtemp = calibrate(calibrator.gtemp,sensor.getTemperature());
+      
+      data.accel=calibrate(calibrator.accel,data.accel,data.gtemp);
+      data.gyro=calibrate(calibrator.gyro,data.gyro,data.gtemp);
       check.gyro.last=millis();
   }
   else if (millis()-check.gyro.last>check.gyro.timeout){
@@ -515,12 +561,8 @@ void loop() {
   data.volt =calibrate(calibrator.volt,analogRead(TEST_PIN));
   
   
-  if (data.gtemp < 40) { 
-    if (data.volt > 3.15) 
-      {if (power <= 250) power += 5;
-      else if (power >= 10) power -= 10;}
-    else power = 0;
-  }
+  if (data.gtemp < check.termo.targetTemp-check.termo.tempThreshold && data.volt > check.termo.minVoltage+check.termo.voltThreshold)digitalWrite(HOT_PIN,HIGH);
+  else if(data.gtemp > check.termo.targetTemp || data.volt < check.termo.minVoltage)  digitalWrite(HOT_PIN,LOW);
   
   data.now=millis();
   
@@ -528,6 +570,8 @@ void loop() {
   dataToCsv(data,row,sizeof(row));
   Serial.print(row);
   if(check.SD.OK){
+    digitalWrite(SD_CS, LOW); // Ensure SD is deselected
+    digitalWrite(CS_PIN, HIGH);
     File file = SD.open("/data.csv", FILE_APPEND);
     if (file) {
       check.SD.last=millis();
@@ -537,20 +581,25 @@ void loop() {
     }else{
       check.SD.OK=false;
     }
+    digitalWrite(SD_CS, HIGH);
   }else sdConnect();
 
   if (millis() - check.SMS.last> check.SMS.timeout) {
     sendSMS(Serial2);
   }
-
-  if (millis() - check.LoRa.last > check.LoRa.timeout) {
-    generatePayload();
+  if(millis() - check.LoRa.last > check.LoRa.timeout){
+  LoRaCheck();
+  if (check.LoRa.OK) {
+    digitalWrite(SD_CS, HIGH);
+    digitalWrite(CS_PIN, LOW);
+    generatePayload(payload);
     LoRa.beginPacket();
     LoRa.write(payload, 1 + sizeof(SensorData) + 1);
-    check.LoRa.OK=LoRa.endPacket(true);
-    if(check.LoRa.OK)check.LoRa.last=millis();
+    LoRa.endPacket(true);
+    digitalWrite(CS_PIN, HIGH);
   }
-  if(!check.LoRa.OK && millis()-check.LoRa.last>check.LoRa.timeout){
+  else{
     LoRaConnect();
   }
+  check.LoRa.last=millis();}
 }
