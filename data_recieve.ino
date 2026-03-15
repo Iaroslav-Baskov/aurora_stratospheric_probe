@@ -37,7 +37,7 @@ const char* labels[] = {
   "gx", "gy", "gz",
   "ax[m/s2]", "ay[m/s2]", "az[m/s2]",
   "gtemp[C]",
-  "magx[G]", "magy[G]", "magz[G]",
+  "magx[uT]", "magy[uT]", "magz[uT]",
   "voltage",
   "pm1_0", "pm2_5", "pm10_0",
   "p03um", "p05um", "p10um",
