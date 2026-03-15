@@ -9,6 +9,9 @@
 #include <Adafruit_AHTX0.h>
 #include <Wire.h>
 
+#include <Adafruit_Sensor.h>
+#include <Adafruit_HMC5883_U.h>
+
 #define CS_PIN    4
 #define RST       14
 #define DIO0      27
@@ -26,8 +29,8 @@
 #define HOT_PIN   32
 #define TEST_PIN  35
 
-#define QMC5883L_ADDRESS 0x1E
 
+Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
 GY521 sensor(0x68);
 BMP280 bmp280;
 Adafruit_AHTX0 aht;
@@ -40,20 +43,25 @@ const char* labels[]={
   "gx","gy","gz",
   "ax[m/s2]","ay[m/s2]","az[m/s2]",
   "gtemp[C]",
-  "magx[G]","magy[G]","magz[G]",
+  "magx[uT]","magy[uT]","magz[uT]",
   "voltage",
   "pm1_0","pm2_5","pm10_0",
   "p03um","p05um","p10um",
   "lat","lon","altitude","2G",
 };
 
+const uint8_t GPSsettings[]={
+  0xB5, 0x62, 0x06, 0x24, 0x24, 0x00, 0xFF, 0xFF, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x10, 0x27, 
+  0x00, 0x00, 0x05, 0x00, 0xFA, 0x00, 0xFA, 0x00, 0x64, 0x00, 0x2C, 0x01, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0xDC
+};
 
 struct float3d{
   float x,y,z;};
 struct int16_t3d{
   int16_t x,y,z;};
   
-struct SensorData {
+struct __attribute__((packed)) SensorData {
   float lon, lat, altitude;
   unsigned long now;
   unsigned int UT_seconds;
@@ -166,22 +174,6 @@ float3d calibrate(sensor3d dataset, int16_t3d value,float t=-300){
   }
   return v;
 }
-void getMag(float3d &output,sensor3d calibrator,float t) {
-    check.mag.last = millis();
-    int16_t3d result;
-  
-    Wire.beginTransmission(QMC5883L_ADDRESS);
-    Wire.write(0x00);
-    Wire.endTransmission();
-    Wire.requestFrom(QMC5883L_ADDRESS, 6);
-  
-    if (Wire.available() >= 6) {
-      result.x = Wire.read() | (Wire.read() << 8);
-      result.y = Wire.read() | (Wire.read() << 8);
-      result.z = Wire.read() | (Wire.read() << 8);
-      output=calibrate(calibrator,result,t=t);
-   }
-}
 bool i2cDevicePresent(uint8_t address) {
     Wire.beginTransmission(address);
     return (Wire.endTransmission() == 0);
@@ -190,7 +182,7 @@ void checkI2CDevices() {
     check.gyro.OK = check.gyro.OK && i2cDevicePresent(0x68);
     check.BMP.OK = check.BMP.OK && i2cDevicePresent(0x77);
     check.AHT.OK =check.AHT.OK && i2cDevicePresent(0x38);
-    check.mag.OK =check.mag.OK && i2cDevicePresent(QMC5883L_ADDRESS);
+    check.mag.OK =check.mag.OK && i2cDevicePresent(0x1E);
 }
 
 bool readPMSFrame(Stream &serial, uint8_t *buffer) { // Чтение 32 байт из PMS 
@@ -212,7 +204,6 @@ bool readPMSFrame(Stream &serial, uint8_t *buffer) { // Чтение 32 байт
     }
   }
   if(millis()-check.pms.last>check.pms.timeout){
-    
     check.pms.last=millis();
     check.pms.OK=false;
     pmsConnect();
@@ -264,7 +255,6 @@ void dataToCsv(SensorData data,char buffer[],int len){
 }
 void sdConnect(){
   Serial.println("sd connect");
-  digitalWrite(SD_CS, LOW);
   check.SD.OK=SD.begin(SD_CS);
   if(check.SD.OK){
     check.SD.last=millis();
@@ -279,7 +269,6 @@ void sdConnect(){
         file.close();}
     }
   }
-  digitalWrite(SD_CS, HIGH);
 }
 
 void LoRaConnect(){
@@ -301,15 +290,13 @@ void LoRaCheck(){
   
   // Start SPI manual transaction
   SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(SD_CS, HIGH);
-  digitalWrite(CS_PIN, LOW); // Select LoRa
-  
-  // Send 0x42 (Version Register). 
+  digitalWrite(CS_PIN, LOW);
+  // Send 0x42 (Version Register).
   // In SPI, the 8th bit is 0 for Read, 1 for Write.
   SPI.transfer(0x42 & 0x7F); 
   version = SPI.transfer(0x00); // Read the result
   
-  digitalWrite(CS_PIN, HIGH); // Deselect LoRa
+  digitalWrite(CS_PIN, HIGH);
   SPI.endTransaction();
   if(version!=0x12){
   check.LoRa.OK=false;}}
@@ -337,23 +324,10 @@ void accelConnect(){
     }
   }else Serial.println("accel not found");
 }
-void magnConnect(){
-  Serial.println("magn connect");
-  check.mag.last=millis();
-  
-  check.mag.OK = i2cDevicePresent(QMC5883L_ADDRESS);
-  if(check.mag.OK){
-    Wire.beginTransmission(QMC5883L_ADDRESS);
-    Wire.write(0x09);
-    Wire.write(0b00011101); // OSR=512, 8G, 200Hz, continuous
-    Wire.endTransmission();
-  
-    Wire.beginTransmission(QMC5883L_ADDRESS);
-    Wire.write(0x0B);
-    Wire.write(0x01);
-    Wire.endTransmission();
-  }
-  else Serial.println("magn no found");
+void magnConnect() {
+  Serial.println("HMC5883L connect...");
+  check.mag.last = millis();
+  check.mag.OK =mag.begin();
 }
 void startI2CDevices(){
   delay(500);
@@ -373,9 +347,11 @@ void pmsConnect(){
 void gpsConnect(){
   Serial.println("gps connect");
   Serial1.end();
-  delay(500);
+  delay(100);
   Serial1.begin(9600, SERIAL_8N1, RXD1, TXD1);
   check.GPS.last=millis();
+  delay(50);
+  Serial1.write(GPSsettings,sizeof(GPSsettings));
 }
 bool readGPSFrame(Stream &serial){
   if(serial.available()){
@@ -425,11 +401,13 @@ int get2gQuality(Stream &serial){
   delay(50);
   String output=serial.readString();
   int start=output.indexOf(": ");
+  if(start>=0){
   output=output.substring(start+2,start+4);
   if(output[1]==','){
     output=output.substring(0,1);
   }
-  return (int) calibrate(calibrator.q2G,(int)output.toInt());
+  return (int) calibrate(calibrator.q2G,(int)output.toInt());}
+  return 0;
 }
 void sendSMS(Stream &serial) {
   if(checkSMS(serial)){
@@ -455,11 +433,9 @@ void setup() {
   startI2CDevices();
   
   pinMode(HOT_PIN, OUTPUT);
-  pinMode(CS_PIN, OUTPUT);
-  pinMode(SD_CS, OUTPUT);
 
   LoRa.setPins(CS_PIN, RST, DIO0);
-  check.LoRa.timeout=timeOnAir_ms(12, 62.5E3, 8, sizeof(payload), true, true);
+  check.LoRa.timeout=timeOnAir_ms(12, 62.5E3, 8-4, sizeof(payload), true, true);
   check.SMS.timeout=5000;
   check.GPS.timeout=5000;
   check.pms.timeout=5000;
@@ -468,26 +444,24 @@ void setup() {
   check.gyro.timeout=1000;
   check.mag.timeout=1000;
   
-  calibrator.gyro.tempOffset.x=-0.021586792358359117;
-  calibrator.gyro.offset.x=2.0293925221537843;
-  calibrator.gyro.tempOffset.y=-0.0203030523388205;
-  calibrator.gyro.offset.y=2.0367279043462965;
-  calibrator.gyro.tempOffset.z=-0.005832454539831707;
-  calibrator.gyro.offset.z=-0.2910172807975372;
-  calibrator.accel.offset.x=0.03764483705436618;
-  calibrator.accel.scale.x=9.89667167880515;
-  calibrator.accel.offset.y=0.0039877343303261386;
-  calibrator.accel.scale.y=9.91839443251234;
-  calibrator.accel.offset.z=-0.0007502589765589077;
-  calibrator.accel.scale.z=9.620605996593481;
-  calibrator.mag.offset.x=499.22560443025856;
-  calibrator.mag.scale.x=0.00033468981790177587;
-  calibrator.mag.offset.y=406.10800404767446;
-  calibrator.mag.scale.y=0.00032792114858669303;
-  calibrator.mag.offset.z=254.62126909439348;
-  calibrator.mag.scale.z=0.0003375361890145562;
+  calibrator.gyro.offset.x=2.336;
+  calibrator.gyro.offset.y=2.351;
+  calibrator.gyro.offset.z=-0.221;
+  calibrator.accel.offset.x=0.035378469830884045;
+  calibrator.accel.scale.x=10.01711296392382;
+  calibrator.accel.offset.y=-0.010919070720751357;
+  calibrator.accel.scale.y=9.854182783125843;
+  calibrator.accel.offset.z=-0.0060115734257293755;
+  calibrator.accel.scale.z=9.569241972040562;
+  calibrator.mag.offset.x=5.366870287924152;
+  calibrator.mag.scale.x=0.016582142355231737;
+  calibrator.mag.offset.y=0.006721965124168969;
+  calibrator.mag.scale.y=0.017311197233859283;
+  calibrator.mag.offset.z=1.995942680175688;
+  calibrator.mag.scale.z=0.015840111362090927;
   calibrator.gtemp.offset=21.892719725589476;
   calibrator.gtemp.scale=0.8899545931264473;
+
 
   calibrator.volt.scale=3.10/4095;
   calibrator.volt.offset=-0.97*4095/3.10;
@@ -499,8 +473,6 @@ void setup() {
   check.termo.minVoltage=3.1;
   check.termo.voltThreshold=0.2;
   
-  digitalWrite(CS_PIN, HIGH);
-  digitalWrite(SD_CS, HIGH);
   
   gpsConnect();
   pmsConnect();
@@ -553,7 +525,17 @@ void loop() {
     bmpConnect();
   }
   if(check.mag.OK){
-    getMag(data.mag,calibrator.mag,data.gtemp);}
+      sensors_event_t event; 
+      if (mag.getEvent(&event)) {
+        data.mag.x=event.magnetic.x;
+        data.mag.y=event.magnetic.y;
+        data.mag.z=event.magnetic.z;}
+      else {
+        check.mag.OK = false; // Mark as failed if the library returns false
+      }
+      data.mag=calibrate(calibrator.mag,data.mag);
+      check.mag.last=millis();
+  }
   else if (millis()-check.mag.last>check.mag.timeout){
     magnConnect();
   }
@@ -570,8 +552,6 @@ void loop() {
   dataToCsv(data,row,sizeof(row));
   Serial.print(row);
   if(check.SD.OK){
-    digitalWrite(SD_CS, LOW); // Ensure SD is deselected
-    digitalWrite(CS_PIN, HIGH);
     File file = SD.open("/data.csv", FILE_APPEND);
     if (file) {
       check.SD.last=millis();
@@ -581,7 +561,6 @@ void loop() {
     }else{
       check.SD.OK=false;
     }
-    digitalWrite(SD_CS, HIGH);
   }else sdConnect();
 
   if (millis() - check.SMS.last> check.SMS.timeout) {
@@ -590,13 +569,10 @@ void loop() {
   if(millis() - check.LoRa.last > check.LoRa.timeout){
   LoRaCheck();
   if (check.LoRa.OK) {
-    digitalWrite(SD_CS, HIGH);
-    digitalWrite(CS_PIN, LOW);
     generatePayload(payload);
     LoRa.beginPacket();
     LoRa.write(payload, 1 + sizeof(SensorData) + 1);
     LoRa.endPacket(true);
-    digitalWrite(CS_PIN, HIGH);
   }
   else{
     LoRaConnect();
