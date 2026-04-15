@@ -38,16 +38,16 @@ TinyGPSPlus gps;
 
 const char* labels[]={
   "now[ms]","UT[s]",
-  "AHT_tmp[C]","AHT_hum",
+  "AHT_temp[C]","AHT_hum",
   "BMP_temp[C]","BMP_pres",
   "gx","gy","gz",
   "ax[m/s2]","ay[m/s2]","az[m/s2]",
   "gtemp[C]",
   "magx[uT]","magy[uT]","magz[uT]",
-  "voltage",
+  "voltage", 
   "pm1_0","pm2_5","pm10_0",
   "p03um","p05um","p10um",
-  "lat","lon","altitude","2G",
+  "lat","lon","altitude","2G","flags"
 };
 
 const uint8_t GPSsettings[]={
@@ -62,27 +62,31 @@ struct int16_t3d{
   int16_t x,y,z;};
   
 struct __attribute__((packed)) SensorData {
-  float lon, lat, altitude;
   unsigned long now;
-  unsigned int UT_seconds;
-  float AHT_temp, AHT_hum;
-  float BMP_temp, BMP_pres;
-  float3d accel;
-  float3d gyro;
-  float gtemp;
-  float3d mag;
-  float volt;
-  unsigned int pm1_0, pm2_5, pm10_0;
-  unsigned int p03um, p05um, p10um;
+  unsigned long UT_seconds;
+  int16_t AHT_temp, AHT_hum;
+  int16_t BMP_temp, BMP_pres; 
+  int16_t3d gyro;         
+  int16_t3d accel;
+  int16_t gtemp; 
+  int16_t3d mag;          
+  int16_t volt;   
+  uint16_t pm1_0, pm2_5, pm10_0; 
+  uint16_t p03um, p05um, p10um;
+  float lat, lon;
+  uint16_t altitude;
   int q2G;
+  uint8_t flags; 
 };
 
 struct device{
+  uint8_t flagpos=0;
   bool OK=false;
   unsigned long last=0;
   unsigned long timeout=1000;
 };
 struct heatDevice{
+  uint8_t flagpos=0;
   bool isOn=false;
   unsigned long last=0;
   float targetTemp=0;
@@ -101,9 +105,10 @@ struct sensor1d{
   float t0=0;
 };
 struct sensor3d{
-  float3d offset={0,0,0};
-  float3d scale={1,1,1};
-  float3d tempOffset={0,0,0};
+  sensor1d x;
+  sensor1d y;
+  sensor1d z;
+  
   float t0=0;
 };
 struct calibrationInfo{
@@ -140,39 +145,13 @@ void generatePayload(uint8_t *payload) {
   payload[1 + sizeof(SensorData)] = 0xBB;  // конечный байт
 }
 
-float calibrate(sensor1d dataset, float value,float t=-300){
+int calibrate(sensor1d dataset, float value,float multiplier=1,float t=-300){
   if(t!=-300)return (value-dataset.offset-dataset.tempOffset*(t-dataset.t0))*dataset.scale;
-  return (value-dataset.offset)*dataset.scale;
+  return (int)((value-dataset.offset)*dataset.scale*multiplier);
 }
-float calibrate(sensor1d dataset, int value,float t=-300){
+int calibrate(sensor1d dataset, int value,float multiplier=1,float t=-300){
   if(t!=-300)return (int)((value-dataset.offset-dataset.tempOffset*(t-dataset.t0))*dataset.scale);
-  return ((value-dataset.offset)*dataset.scale);
-}
-float3d calibrate(sensor3d dataset, float3d value,float t=-300){
-  float3d v;
-  if (t!=-300){
-    v.x=(value.x-dataset.offset.x-dataset.tempOffset.x*(t-dataset.t0))*dataset.scale.x;
-    v.y=(value.y-dataset.offset.y-dataset.tempOffset.y*(t-dataset.t0))*dataset.scale.y;
-    v.z=(value.z-dataset.offset.z-dataset.tempOffset.z*(t-dataset.t0))*dataset.scale.z;}
-  else{
-    v.x=(value.x-dataset.offset.x)*dataset.scale.x;
-    v.y=(value.y-dataset.offset.y)*dataset.scale.y;
-    v.z=(value.z-dataset.offset.z)*dataset.scale.z;
-  }
-  return v;
-}
-float3d calibrate(sensor3d dataset, int16_t3d value,float t=-300){
-  float3d v;
-  if (t!=-300){
-    v.x=((float)value.x-dataset.offset.x-dataset.tempOffset.x*(t-dataset.t0))*dataset.scale.x;
-    v.y=((float)value.y-dataset.offset.y-dataset.tempOffset.y*(t-dataset.t0))*dataset.scale.y;
-    v.z=((float)value.z-dataset.offset.z-dataset.tempOffset.z*(t-dataset.t0))*dataset.scale.z;}
-  else{
-    v.x=((float)value.x-dataset.offset.x)*dataset.scale.x;
-    v.y=((float)value.y-dataset.offset.y)*dataset.scale.y;
-    v.z=((float)value.z-dataset.offset.z)*dataset.scale.z;
-  }
-  return v;
+  return (int)((value-dataset.offset)*dataset.scale*multiplier);
 }
 bool i2cDevicePresent(uint8_t address) {
     Wire.beginTransmission(address);
@@ -213,44 +192,58 @@ bool readPMSFrame(Stream &serial, uint8_t *buffer) { // Чтение 32 байт
 void dataToJson(SensorData data,char buffer[],int len){
   int i=0;
   snprintf(buffer, len,
-    "{\"%s\":%d,\"%s\":%d,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.0f,"
-    "\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,"
-    "\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%d,"
+    "{\"%s\":%d,\"%s\":%d,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%lu,"
+    "\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,"
+    "\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.3f,\"%s\":%d,"
     "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%.9f,\"%s\":%.9f,"
-    "\"%s\":%.0f,\"%s\":%d}\n",
+    "\"%s\":%d,\"%s\":%d,\"%s\":%d}\n",
     labels[i++],data.now,labels[i++],data.UT_seconds,
-    labels[i++],data.AHT_temp,labels[i++],data.AHT_hum,
-    labels[i++],data.BMP_temp,labels[i++],data.BMP_pres,
-    labels[i++],data.gyro.x,labels[i++],data.gyro.y,labels[i++],data.gyro.z,
-    labels[i++],data.accel.x,labels[i++],data.accel.y,labels[i++],data.accel.z,
-    labels[i++],data.gtemp,
-    labels[i++],data.mag.x,labels[i++],data.mag.y,labels[i++],data.mag.z,
-    labels[i++],data.volt,
+    labels[i++],(float)data.AHT_temp/100,labels[i++],(float)data.AHT_hum/100,
+    labels[i++],(float)data.BMP_temp/100,labels[i++],(long)data.BMP_pres*10,
+    labels[i++],(float)data.gyro.x/100,labels[i++],(float)data.gyro.y/100,labels[i++],(float)data.gyro.z/100,
+    labels[i++],(float)data.accel.x/1000,labels[i++],(float)data.accel.y/1000,labels[i++],(float)data.accel.z/1000,
+    labels[i++],(float)data.gtemp/100,
+    labels[i++],(float)data.mag.x/100,labels[i++],(float)data.mag.y/100,labels[i++],(float)data.mag.z/100,
+    labels[i++],(float)data.volt/1000,
     labels[i++],data.pm1_0,labels[i++], data.pm2_5,labels[i++], data.pm10_0,
     labels[i++],data.p03um, labels[i++],data.p05um, labels[i++],data.p10um,
     labels[i++],data.lat,
     labels[i++],data.lon,
     labels[i++],data.altitude,
     labels[i++],data.q2G,
-    labels[i++]);
+    labels[i++],data.flags);
 }
-void dataToCsv(SensorData data,char buffer[],int len){
-  snprintf(buffer, len,
-    "%d,%d,%.2f,%.2f,%.2f,%.0f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%d,%d,%d,%d,%d,%d,%.9f,%.9f,%.0f,%d\n",
-    data.now,data.UT_seconds,
-    data.AHT_temp,data.AHT_hum,
-    data.BMP_temp,data.BMP_pres,
-    data.gyro.x,data.gyro.y,data.gyro.z,
-    data.accel.x,data.accel.y,data.accel.z,
-    data.gtemp,
-    data.mag.x,data.mag.y,data.mag.z,
-    data.volt,
-    data.pm1_0, data.pm2_5, data.pm10_0,
-    data.p03um, data.p05um, data.p10um,
+void dataToCsv(SensorData data, char buffer[], int len) {
+    snprintf(buffer, len,
+    "%u,%u,%.2f,%.2f,%.2f,%lu,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%.3f,%u,%u,%u,%u,%u,%u,%.9f,%.9f,%d,%d,%d\n",
+    data.now, 
+    data.UT_seconds,
+    (float)data.AHT_temp / 100.0, 
+    (float)data.AHT_hum / 100.0,
+    (float)data.BMP_temp / 100.0, 
+    (long)data.BMP_pres*10,
+    (float)data.gyro.x / 100.0, 
+    (float)data.gyro.y / 100.0, 
+    (float)data.gyro.z / 100.0,
+    (float)data.accel.x / 1000.0, 
+    (float)data.accel.y / 1000.0, 
+    (float)data.accel.z / 1000.0,
+    (float)data.gtemp / 100.0,
+    (float)data.mag.x / 100.0, 
+    (float)data.mag.y / 100.0, 
+    (float)data.mag.z / 100.0,
+    (float)data.volt / 1000.0,
+    data.pm1_0, 
+    data.pm2_5, 
+    data.pm10_0,
+    data.p03um, 
+    data.p05um, 
+    data.p10um,
     data.lat,
     data.lon,
     data.altitude,
-    data.q2G
+    data.q2G,
+    data.flags
   );
 }
 void sdConnect(){
@@ -276,7 +269,6 @@ void LoRaConnect(){
   digitalWrite(RST, LOW);
   delay(10);
   digitalWrite(RST, HIGH);
-  LoRa.sleep();
   check.LoRa.OK=LoRa.begin(433E6);
   if(check.LoRa.OK){
     check.LoRa.last=millis();
@@ -363,7 +355,7 @@ bool readGPSFrame(Stream &serial){
       data.lat = gps.location.lat();
       data.lon = gps.location.lng();}
     if (gps.altitude.isValid()){
-      data.altitude = gps.altitude.meters();}
+      data.altitude = (uint16_t)gps.altitude.meters();}
     if (gps.time.isValid()){
       data.UT_seconds=gps.time.second()+gps.time.minute()*60+gps.time.hour()*3600;
     }
@@ -444,24 +436,17 @@ void setup() {
   check.gyro.timeout=1000;
   check.mag.timeout=1000;
   
-  calibrator.gyro.offset.x=2.336;
-  calibrator.gyro.offset.y=2.351;
-  calibrator.gyro.offset.z=-0.221;
-  calibrator.accel.offset.x=0.035378469830884045;
-  calibrator.accel.scale.x=10.01711296392382;
-  calibrator.accel.offset.y=-0.010919070720751357;
-  calibrator.accel.scale.y=9.854182783125843;
-  calibrator.accel.offset.z=-0.0060115734257293755;
-  calibrator.accel.scale.z=9.569241972040562;
-  calibrator.mag.offset.x=5.366870287924152;
-  calibrator.mag.scale.x=0.016582142355231737;
-  calibrator.mag.offset.y=0.006721965124168969;
-  calibrator.mag.scale.y=0.017311197233859283;
-  calibrator.mag.offset.z=1.995942680175688;
-  calibrator.mag.scale.z=0.015840111362090927;
+  calibrator.gyro.x.offset=2.336;
+  calibrator.gyro.y.offset=2.351;
+  calibrator.gyro.z.offset=-0.221;
+  calibrator.accel.x.offset=0.035378469830884045;
+  calibrator.accel.x.scale=10.01711296392382;
+  calibrator.accel.y.offset=-0.010919070720751357;
+  calibrator.accel.y.scale=9.854182783125843;
+  calibrator.accel.z.offset=-0.0060115734257293755;
+  calibrator.accel.z.scale=9.569241972040562;
   calibrator.gtemp.offset=21.892719725589476;
   calibrator.gtemp.scale=0.8899545931264473;
-
 
   calibrator.volt.scale=3.10/4095;
   calibrator.volt.offset=-0.97*4095/3.10;
@@ -492,17 +477,15 @@ void loop() {
   
   if(check.gyro.OK){
       sensor.read();
-      data.accel.x = sensor.getAccelX();
-      data.accel.y = sensor.getAccelY();
-      data.accel.z = sensor.getAccelZ();
-      data.gyro.x = sensor.getGyroX();
-      data.gyro.y = sensor.getGyroY();
-      data.gyro.z = sensor.getGyroZ();
+      data.accel.x = calibrate(calibrator.accel.x,sensor.getAccelX(),1000);
+      data.accel.y = calibrate(calibrator.accel.y,sensor.getAccelY(),1000);
+      data.accel.z = calibrate(calibrator.accel.z,sensor.getAccelZ(),1000);
+      data.gyro.x = calibrate(calibrator.gyro.x,sensor.getGyroX(),100);
+      data.gyro.y = calibrate(calibrator.gyro.y,sensor.getGyroY(),100);
+      data.gyro.z = calibrate(calibrator.gyro.z,sensor.getGyroZ(),100);
   
-      data.gtemp = calibrate(calibrator.gtemp,sensor.getTemperature());
+      data.gtemp = calibrate(calibrator.gtemp,sensor.getTemperature(),100);
       
-      data.accel=calibrate(calibrator.accel,data.accel,data.gtemp);
-      data.gyro=calibrate(calibrator.gyro,data.gyro,data.gtemp);
       check.gyro.last=millis();
   }
   else if (millis()-check.gyro.last>check.gyro.timeout){
@@ -511,15 +494,15 @@ void loop() {
   if(check.AHT.OK){
     sensors_event_t humidity, temp;
     aht.getEvent(&humidity, &temp);
-    data.AHT_temp = temp.temperature;
-    data.AHT_hum = humidity.relative_humidity;
+    data.AHT_temp = temp.temperature*100;
+    data.AHT_hum = humidity.relative_humidity*100;
   }
   else if (millis()-check.AHT.last>check.AHT.timeout){
     ahtConnect();
   }
   if(check.BMP.OK){
-    data.BMP_temp = bmp280.getTemperature();
-    data.BMP_pres = bmp280.getPressure();
+    data.BMP_temp = bmp280.getTemperature()*100;
+    data.BMP_pres = bmp280.getPressure()/10;
   }
   else if (millis()-check.BMP.last>check.BMP.timeout){
     bmpConnect();
@@ -527,30 +510,41 @@ void loop() {
   if(check.mag.OK){
       sensors_event_t event; 
       if (mag.getEvent(&event)) {
-        data.mag.x=event.magnetic.x;
-        data.mag.y=event.magnetic.y;
-        data.mag.z=event.magnetic.z;}
+        data.mag.x=calibrate(calibrator.mag.x,event.magnetic.x,100);
+        data.mag.y=calibrate(calibrator.mag.y,event.magnetic.y,100);
+        data.mag.z=calibrate(calibrator.mag.z,event.magnetic.z,100);}
       else {
         check.mag.OK = false; // Mark as failed if the library returns false
       }
-      data.mag=calibrate(calibrator.mag,data.mag);
       check.mag.last=millis();
   }
   else if (millis()-check.mag.last>check.mag.timeout){
     magnConnect();
   }
 
-  data.volt =calibrate(calibrator.volt,analogRead(TEST_PIN));
+  data.volt =calibrate(calibrator.volt,analogRead(TEST_PIN),1000);
   
   
-  if (data.gtemp < check.termo.targetTemp-check.termo.tempThreshold && data.volt > check.termo.minVoltage+check.termo.voltThreshold)digitalWrite(HOT_PIN,HIGH);
-  else if(data.gtemp > check.termo.targetTemp || data.volt < check.termo.minVoltage)  digitalWrite(HOT_PIN,LOW);
+//  if (data.gtemp < check.termo.targetTemp-check.termo.tempThreshold && data.volt/1000 > check.termo.minVoltage+check.termo.voltThreshold)
+//  { check.termo.isOn=true;
+//    digitalWrite(HOT_PIN,HIGH);}
+//  else if(data.gtemp > check.termo.targetTemp || data.volt/1000 < check.termo.minVoltage){
+//    check.termo.isOn=false;
+//    digitalWrite(HOT_PIN,LOW);}
+  
   
   data.now=millis();
-  
+  if(data.now%2000>1000){
+    check.termo.isOn=true;
+    digitalWrite(HOT_PIN,HIGH);
+  }
+  else{
+    check.termo.isOn=false;
+    digitalWrite(HOT_PIN,LOW);
+  }
+  data.flags=(data.flags & ~(1 << check.termo.flagpos)) | (uint8_t(check.termo.isOn) << check.termo.flagpos);
   
   dataToCsv(data,row,sizeof(row));
-  Serial.print(row);
   if(check.SD.OK){
     File file = SD.open("/data.csv", FILE_APPEND);
     if (file) {
@@ -562,7 +556,8 @@ void loop() {
       check.SD.OK=false;
     }
   }else sdConnect();
-
+  dataToJson(data,row,sizeof(row));
+  Serial.print(row);
   if (millis() - check.SMS.last> check.SMS.timeout) {
     sendSMS(Serial2);
   }
