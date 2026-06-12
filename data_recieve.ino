@@ -1,9 +1,11 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <BluetoothSerial.h>
+#include <RS-FEC.h> // Include Reed-Solomon library
 
-// Pins for the Receiver (matches your first snippet)
+// Pins for the Receiver
 #define CS    4
+#define CR    8
 #define RST   15
 #define DIO0  2
 
@@ -14,45 +16,116 @@ struct int16_t3d {
   int16_t x, y, z;
 };
 
-// UPDATED: Matches the Transmitter's packed structure and data types
-struct __attribute__((packed)) SensorData {
-  unsigned long now;          
-  unsigned long UT_seconds;   
-  int16_t AHT_temp, AHT_hum;  
-  int16_t BMP_temp, BMP_pres; 
-  int16_t3d gyro;             
-  int16_t3d accel;            
-  int16_t gtemp;              
-  int16_t3d mag;              
-  int16_t volt;               
+// Matches the Transmitter's packed structure and data types
+
+struct __attribute__((packed)) ScientificData {
+  unsigned long now;
+  int16_t AHT_temp, AHT_hum;
+  int16_t BMP_temp;
+  uint16_t BMP_pres;
   uint16_t pm1_0, pm2_5, pm10_0; 
-  uint16_t p03um, p05um, p10um;  
-  float lat, lon;             
-  uint16_t altitude;          
-  int q2G;                    
-  uint8_t flags;              
+  uint16_t p03um, p05um, p10um;
+  float lat, lon;
+  uint16_t altitude;
 };
 
-const char* labels[] = {
-  "now[ms]", "UT[s]",
+struct __attribute__((packed)) TechnicalData {
+  unsigned long now;
+  int16_t3d gyro;
+  int16_t3d accel;
+  int16_t gtemp; 
+  int16_t3d mag;
+  int16_t volt;
+  uint8_t q2G;
+  uint8_t flags;
+};
+
+struct __attribute__((packed)) ReceiveData {
+  int rssi;
+  float snr;
+  int errors;
+  bool malformed;
+};
+
+template<typename T, uint8_t parity>
+struct receiver {
+  T *sentData;
+  uint8_t dataLen;
+  uint8_t reg;
+  // Use template parameters directly here
+  RS::ReedSolomon<sizeof(T), parity> rs; 
+  uint8_t par;
+  // Dynamic allocation sizing based on template parameters
+  uint8_t payload[sizeof(T) + parity + 1];
+
+  receiver(T *data, uint8_t r) : 
+    sentData(data),
+    dataLen(sizeof(T)),
+    reg(r),
+    par(parity) {} // Moved initialization of 'par' inside the constructor list
+};
+
+const char* scientific_labels[] = {
+  "now[ms]",
   "AHT_temp[C]", "AHT_hum",
   "BMP_temp[C]", "BMP_pres",
+  "pm1_0", "pm2_5", "pm10_0",
+  "p03um", "p05um", "p10um",
+  "lat", "lon", "altitude"
+};
+
+const char* technical_labels[] = {
+  "now[ms]",
   "gx", "gy", "gz",
   "ax[m/s2]", "ay[m/s2]", "az[m/s2]",
   "gtemp[C]",
   "magx[uT]", "magy[uT]", "magz[uT]",
-  "voltage",
-  "pm1_0", "pm2_5", "pm10_0",
-  "p03um", "p05um", "p10um",
-  "lat", "lon", "altitude", "2Grssi", "flags", "rssi", "snr", "malformed"
+  "voltage", "2Grssi", "flags"
 };
 
-int expected_payload_size;
-SensorData data;
+// Global radio labels for the ReceiveData structure
+const char* radio_labels[] = {
+  "rssi", "snr", "malformed", "errors"
+};
+
+ReceiveData radioInfo;
+
+ScientificData allData;
+TechnicalData additData;
+
+receiver<ScientificData,8> allReceive(&allData,0x01);
+receiver<TechnicalData,8> additReceive(&additData,0x08);
+
 char row[2048];
 
+void dataToJson(ScientificData d, char buffer[], ReceiveData d2);
+void dataToJson(TechnicalData d, char buffer[], ReceiveData d2);
+void generateErrorRow(char buffer[], const ReceiveData& rd, const uint8_t* payload, int actualSize);
+
+template<typename T, uint8_t parity>
+auto receive(receiver<T, parity> &Sender, ReceiveData &rec, int len) -> bool {
+  if(Sender.payload[0]!=Sender.reg || Sender.dataLen + Sender.par +1 != len){
+    rec.malformed=true;
+    rec.errors=0;
+    return false;
+  }
+  
+  uint8_t inputWorkBuffer[sizeof(T) + parity];
+  
+  Sender.rs.Decode(inputWorkBuffer, &Sender.payload[1]);
+  rec.errors=0;
+  for (int i = 0; i < Sender.dataLen+Sender.par; i++) {
+      if (inputWorkBuffer[i] != Sender.payload[i+1]) {
+        rec.errors++;
+      }
+  }
+  rec.malformed=(rec.errors*2>Sender.par);
+  memcpy(Sender.sentData, inputWorkBuffer, Sender.dataLen);
+  return true;
+}
+
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   SerialBT.begin("AuroraData", false); 
 
   LoRa.setPins(CS, RST, DIO0);
@@ -61,202 +134,128 @@ void setup() {
     while (true);
   }
 
-  // Size = StartByte(1) + Struct + EndByte(1)
-  expected_payload_size = sizeof(SensorData) + 2; 
+  // Size = StartByte(1) + Struct(msglen) + Parity(ecclen) + EndByte(1)
   
   LoRa.setSpreadingFactor(12);
   LoRa.setSignalBandwidth(62.5E3);
-  LoRa.setCodingRate4(8);
-
-  Serial.println("LoRa Receiver Ready. Matching updated transmitter struct...");
+  LoRa.setCodingRate4(CR);
+  LoRa.setGain(6);
+  LoRa.setPreambleLength(32);
 }
 
 void loop() {
   int packetSize = LoRa.parsePacket();
-
+  uint8_t buffer[255];
   if (packetSize > 0) {
-    std::vector<uint8_t> payload;
-    while (LoRa.available()) {
-      payload.push_back(LoRa.read());
+    Serial.println("recieved");
+    int bytesRead = 0;
+    
+    while (LoRa.available() && bytesRead < 255) {
+      uint8_t ch=LoRa.read();
+      if(allReceive.dataLen+allReceive.par+1>bytesRead)allReceive.payload[bytesRead] = ch;
+      if(additReceive.dataLen+additReceive.par+1>bytesRead)additReceive.payload[bytesRead] = ch;
+      buffer[bytesRead++]=ch;
     }
-
-    int rssi = LoRa.packetRssi();
-    float snr = LoRa.packetSnr();
-
-    // Check size and Framing bytes (0xAA ... 0xBB)
-    if (payload.size() != (size_t)expected_payload_size || payload[0] != 0xAA || payload[payload.size()-1] != 0xBB) {
-      generateErrorRow(row, sizeof(row), payload, expected_payload_size, rssi, snr);
-    } else {
-      memcpy(&data, &payload[1], sizeof(SensorData));
-      dataToJson(data, row, sizeof(row), snr, rssi, false);
+    radioInfo.rssi = LoRa.packetRssi();
+    radioInfo.snr = LoRa.packetSnr();
+    bool flag = false;
+    if(!flag){
+      flag = receive(allReceive,radioInfo,bytesRead);
+      dataToJson(allData, row, radioInfo);
     }
-
+    if(!flag){
+      flag = receive(additReceive, radioInfo ,bytesRead);
+      dataToJson(additData, row, radioInfo);
+    }
+    if(!flag){
+      generateErrorRow(row,radioInfo,buffer, bytesRead);
+    }
     SerialBT.println(row);
     Serial.println(row);
   }
 }
 
-void dataToJson(SensorData d, char buffer[], int len, float snr, int rssi, bool err) {
+void dataToJson(ScientificData d, char buffer[], ReceiveData d2) {
   int i = 0;
-  snprintf(buffer, len,
-    "{\"%s\":%lu,\"%s\":%lu,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%ld,"
-    "\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,"
-    "\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.3f,\"%s\":%u,"
-    "\"%s\":%u,\"%s\":%u,\"%s\":%u,\"%s\":%u,\"%s\":%u,\"%s\":%.9f,\"%s\":%.9f,"
-    "\"%s\":%u,\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%.2f,\"%s\":%d}",
-    labels[i++], d.now, labels[i++], d.UT_seconds,
-    labels[i++], (float)d.AHT_temp/100.0, labels[i++], (float)d.AHT_hum/100.0,
-    labels[i++], (float)d.BMP_temp/100.0, labels[i++], (long)d.BMP_pres*10,
-    labels[i++], (float)d.gyro.x/100.0, labels[i++], (float)d.gyro.y/100.0, labels[i++], (float)d.gyro.z/100.0,
-    labels[i++], (float)d.accel.x/1000.0, labels[i++], (float)d.accel.y/1000.0, labels[i++], (float)d.accel.z/1000.0,
-    labels[i++], (float)d.gtemp/100.0,
-    labels[i++], (float)d.mag.x/100.0, labels[i++], (float)d.mag.y/100.0, labels[i++], (float)d.mag.z/100.0,
-    labels[i++], (float)d.volt/1000.0,
-    labels[i++], d.pm1_0, labels[i++], d.pm2_5, labels[i++], d.pm10_0,
-    labels[i++], d.p03um, labels[i++], d.p05um, labels[i++], d.p10um,
-    labels[i++], d.lat, labels[i++], d.lon, labels[i++], d.altitude,
-    labels[i++], d.q2G, labels[i++], d.flags, labels[i++], rssi, labels[i++], snr, labels[i++], err);
+  int r = 0;
+  snprintf(buffer, 2048,
+    "{"
+    "\"%s\":%lu,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%lu,"
+    "\"gx\":0,\"gy\":0,\"gz\":0,\"ax[m/s2]\":0,\"ay[m/s2]\":0,\"az[m/s2]\":0,\"gtemp[C]\":0,"
+    "\"magx[uT]\":0,\"magy[uT]\":0,\"magz[uT]\":0,\"voltage\":0,"
+    "\"%s\":%u,\"%s\":%u,\"%s\":%u,\"%s\":%u,\"%s\":%u,\"%s\":%u,"
+    "\"%s\":%.9f,\"%s\":%.9f,\"%s\":%u,\"2Grssi\":0,\"flags\":0,"
+    "\"%s\":%d,\"%s\":%.2f,\"%s\":%s,\"%s\":%d"
+    "}",
+    scientific_labels[i++], d.now,
+    scientific_labels[i++], (float)d.AHT_temp / 100.0, 
+    scientific_labels[i++], (float)d.AHT_hum / 100.0,
+    scientific_labels[i++], (float)d.BMP_temp / 100.0, 
+    scientific_labels[i++], (unsigned long)d.BMP_pres * 10,
+    scientific_labels[i++], d.pm1_0, 
+    scientific_labels[i++], d.pm2_5, 
+    scientific_labels[i++], d.pm10_0,
+    scientific_labels[i++], d.p03um, 
+    scientific_labels[i++], d.p05um, 
+    scientific_labels[i++], d.p10um,
+    scientific_labels[i++], d.lat, 
+    scientific_labels[i++], d.lon, 
+    scientific_labels[i++], d.altitude,
+    radio_labels[r++], d2.rssi, 
+    radio_labels[r++], d2.snr, 
+    radio_labels[r++], d2.malformed ? "true" : "false", 
+    radio_labels[r++], d2.errors
+  );
 }
 
-void generateErrorRow(char buffer[], int len, std::vector<uint8_t> payload, int expected, int rssi, float snr) {
-  char hexBuffer[512] = ""; 
+void dataToJson(TechnicalData d, char buffer[], ReceiveData d2) {
+  int i = 0;
+  int r = 0;
+  snprintf(buffer, 2048,
+    "{"
+    "\"%s\":%lu,\"AHT_temp[C]\":0,\"AHT_hum\":0,\"BMP_temp[C]\":0,\"BMP_pres\":0,"
+    "\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,"
+    "\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,"
+    "\"%s\":%.2f,"
+    "\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,"
+    "\"%s\":%.3f,"
+    "\"pm1_0\":0,\"pm2_5\":0,\"pm10_0\":0,\"p03um\":0,\"p05um\":0,\"p10um\":0,"
+    "\"lat\":0.0,\"lon\":0.0,\"altitude\":0,"
+    "\"%s\":%u,\"%s\":%u,"
+    "\"%s\":%d,\"%s\":%.2f,\"%s\":%s,\"%s\":%d"
+    "}",
+    technical_labels[i++], d.now,
+    technical_labels[i++], (float)d.gyro.x / 100.0, 
+    technical_labels[i++], (float)d.gyro.y / 100.0, 
+    technical_labels[i++], (float)d.gyro.z / 100.0,
+    technical_labels[i++], (float)d.accel.x / 1000.0, 
+    technical_labels[i++], (float)d.accel.y / 1000.0, 
+    technical_labels[i++], (float)d.accel.z / 1000.0,
+    technical_labels[i++], (float)d.gtemp / 100.0,
+    technical_labels[i++], (float)d.mag.x / 100.0, 
+    technical_labels[i++], (float)d.mag.y / 100.0, 
+    technical_labels[i++], (float)d.mag.z / 100.0,
+    technical_labels[i++], (float)d.volt / 1000.0,
+    technical_labels[i++], d.q2G, 
+    technical_labels[i++], d.flags,
+    radio_labels[r++], d2.rssi, 
+    radio_labels[r++], d2.snr, 
+    radio_labels[r++], d2.malformed ? "true" : "false", 
+    radio_labels[r++], d2.errors
+  );
+}
+
+void generateErrorRow(char buffer[], const ReceiveData& rd, const uint8_t* payload, int actualSize) {
+  char hexBuffer[256] = ""; 
   char hexByte[4];
-  for (size_t i = 0; i < payload.size() && i < 120; i++) {
+  
+  // Convert raw payload to Hex String safely
+  for (int i = 0; i < actualSize && i < 120; i++) {
     snprintf(hexByte, sizeof(hexByte), "%02X", payload[i]);
     strcat(hexBuffer, hexByte);
   }
-  snprintf(buffer, len,
-    "{\"malformed\":1,\"len\":%d,\"expected\":%d,\"rssi\":%d,\"snr\":%.2f,\"raw\":\"%s\"}",
-    (int)payload.size(), expected, rssi, snr, hexBuffer);
-}#include <SPI.h>
-#include <LoRa.h>
-#include <BluetoothSerial.h>
-#include <ArduinoJson.h>
-
-#define CS    4
-#define RST   15
-#define DIO0  2
-
-BluetoothSerial SerialBT;
-
-// Added packed attribute to prevent memory gaps during memcpy
-struct __attribute__((packed)) float3d {
-  float x, y, z;
-};
-
-struct __attribute__((packed)) SensorData {
-  float lon, lat, altitude;
-  unsigned long now;
-  unsigned int UT_seconds;
-  float AHT_temp, AHT_hum;
-  float BMP_temp, BMP_pres;
-  float3d accel;
-  float3d gyro;
-  float gtemp;
-  float3d mag;
-  float volt;
-  unsigned int pm1_0, pm2_5, pm10_0;
-  unsigned int p03um, p05um, p10um;
-  int q2G;
-};
-
-const char* labels[] = {
-  "now[ms]", "UT[s]",
-  "AHT_tmp[C]", "AHT_hum",
-  "BMP_temp[C]", "BMP_pres",
-  "gx", "gy", "gz",
-  "ax[m/s2]", "ay[m/s2]", "az[m/s2]",
-  "gtemp[C]",
-  "magx[uT]", "magy[uT]", "magz[uT]",
-  "voltage",
-  "pm1_0", "pm2_5", "pm10_0",
-  "p03um", "p05um", "p10um",
-  "lat", "lon", "altitude", "2Grssi", "rssi", "snr"
-};
-
-int normal_size;
-SensorData data;
-int rssi;
-float snr;
-char row[4096];
-
-void setup() {
-  Serial.begin(115200);
-  // Changed to false so your phone can discover the ESP32
-  SerialBT.begin("AuroraData", false); 
-
-  LoRa.setPins(CS, RST, DIO0);
-  if (!LoRa.begin(433E6)) {
-    Serial.println("LoRa init failed!");
-    while (true);
-  }
-
-  normal_size = sizeof(SensorData) + 2; 
-  LoRa.setSpreadingFactor(12);
-  LoRa.setSignalBandwidth(62.5E3);
-  LoRa.setCodingRate4(8);
-
-  Serial.println("LoRa receiver ready");
-}
-
-void loop() {
-  int packetSize = LoRa.parsePacket();
-
-  if (packetSize > 0) {
-    std::vector<uint8_t> payload;
-    while (LoRa.available()) {
-      payload.push_back(LoRa.read());
-    }
-    rssi = LoRa.packetRssi();
-    snr = LoRa.packetSnr();
-
-    if (payload.size() < (size_t)normal_size) {
-      generateErrorRow(row, sizeof(row), payload, normal_size, rssi, snr);
-      SerialBT.println(row);
-      Serial.println(row);
-      return;
-    }
-
-    if (payload[0] != 0xAA || payload[normal_size - 1] != 0xBB) {
-      generateErrorRow(row, sizeof(row), payload, normal_size, rssi, snr);
-      SerialBT.println(row);
-      Serial.println(row);
-      return;
-    }
-
-    memcpy(&data, &payload[1], sizeof(SensorData));
-
-    dataToJson(data, row, sizeof(row), snr, rssi);
-    SerialBT.println(row);
-    Serial.println(row);
-  }
-}
-
-void dataToJson(SensorData data, char buffer[], int len, float snr, int rssi) {
-  int i = 0;
-  // Fixed: Number of format specifiers now matches the 29 labels/variables
-  snprintf(buffer, len,
-    "{\"%s\":%lu,\"%s\":%u,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,"
-    "\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,"
-    "\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%u,"
-    "\"%s\":%u,\"%s\":%u,\"%s\":%u,\"%s\":%u,\"%s\":%u,\"%s\":%.9f,\"%s\":%.9f,"
-    "\"%s\":%.0f,\"%s\":%d,\"%s\":%d,\"%s\":%.2f}",
-    labels[i++], data.now, labels[i++], data.UT_seconds,
-    labels[i++], data.AHT_temp, labels[i++], data.AHT_hum,
-    labels[i++], data.BMP_temp, labels[i++], data.BMP_pres,
-    labels[i++], data.gyro.x, labels[i++], data.gyro.y, labels[i++], data.gyro.z,
-    labels[i++], data.accel.x, labels[i++], data.accel.y, labels[i++], data.accel.z,
-    labels[i++], data.gtemp,
-    labels[i++], data.mag.x, labels[i++], data.mag.y, labels[i++], data.mag.z,
-    labels[i++], data.volt,
-    labels[i++], data.pm1_0, labels[i++], data.pm2_5, labels[i++], data.pm10_0,
-    labels[i++], data.p03um, labels[i++], data.p05um, labels[i++], data.p10um,
-    labels[i++], data.lat, labels[i++], data.lon, labels[i++], data.altitude,
-    labels[i++], data.q2G, labels[i++], rssi, labels[i++], snr);
-}
-
-void generateErrorRow(char buffer[], int len, std::vector<uint8_t> payload, int normal_size, int rssi, float snr) {
-  snprintf(buffer, len,
-    "{\"error\":\"malformed_packet\",\"len\":%d,\"expected\":%d,\"rssi\":%d,\"snr\":%.3f}",
-    (int)payload.size(), normal_size, rssi, snr);
+  
+  snprintf(buffer, 2048,
+    "{\"malformed\":%s,\"len\":%d,\"rssi\":%d,\"snr\":%.2f,\"errors\":%d,\"raw\":\"%s\"}",
+    rd.malformed ? "true" : "false", actualSize, rd.rssi, rd.snr, rd.errors, hexBuffer);
 }
