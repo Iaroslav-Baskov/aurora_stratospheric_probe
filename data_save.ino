@@ -8,9 +8,10 @@
 #include <BMP280.h>
 #include <Adafruit_AHTX0.h>
 #include <Wire.h>
-
+#include <esp_task_wdt.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_HMC5883_U.h>
+#include "RS-FEC.h"
 
 #define CS_PIN    4
 #define RST       14
@@ -29,6 +30,9 @@
 #define HOT_PIN   32
 #define TEST_PIN  35
 
+#define SF 12
+#define CR 8
+#define FREETIME 10
 
 Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
 GY521 sensor(0x68);
@@ -37,7 +41,7 @@ Adafruit_AHTX0 aht;
 TinyGPSPlus gps;
 
 const char* labels[]={
-  "now[ms]","UT[s]",
+  "now[ms]",
   "AHT_temp[C]","AHT_hum",
   "BMP_temp[C]","BMP_pres",
   "gx","gy","gz",
@@ -61,27 +65,61 @@ struct float3d{
 struct int16_t3d{
   int16_t x,y,z;};
   
-struct __attribute__((packed)) SensorData {
+struct __attribute__((packed)) ScientificData {
   unsigned long now;
-  unsigned long UT_seconds;
   int16_t AHT_temp, AHT_hum;
-  int16_t BMP_temp, BMP_pres; 
-  int16_t3d gyro;         
-  int16_t3d accel;
-  int16_t gtemp; 
-  int16_t3d mag;          
-  int16_t volt;   
+  int16_t BMP_temp;
+  uint16_t BMP_pres;
   uint16_t pm1_0, pm2_5, pm10_0; 
   uint16_t p03um, p05um, p10um;
   float lat, lon;
   uint16_t altitude;
-  int q2G;
-  uint8_t flags; 
+};
+
+struct __attribute__((packed)) TechnicalData {
+  unsigned long now;
+  int16_t3d gyro;
+  int16_t3d accel;
+  int16_t gtemp; 
+  int16_t3d mag;
+  int16_t volt;
+  uint8_t q2G;
+  uint8_t flags;
+};
+
+
+unsigned int timeOnAir_ms(uint8_t sf, float bw, uint8_t cr, int len, bool header, bool crc,int preamlen=8) { // calculate time-on-air in milliseconds for LoRa packet 
+  double ts = (double)(1 << sf) / bw * 1000; // symbol duration in ms 
+  double pl = len + (header ? 0 : 4); 
+  double nPayload = 8 + std::max( ceil((8 * pl - 4 * sf + 28 + 16 * crc - 20) / (double)(4 * (sf - 2))) * (cr + 4), 0.0 ); 
+  double tOnAir = (4.25 +preamlen+ nPayload) * ts; 
+  return (unsigned int)ceil(tOnAir); 
+}
+
+template<typename T,uint8_t parity>
+struct sender{
+  T *sentData;
+  uint8_t dataLen;
+  uint8_t reg;
+  uint8_t timeout;
+  uint8_t quenue=0;
+  uint8_t maxQuenue;
+  RS::ReedSolomon<sizeof(T),parity> rs;
+  uint8_t par=parity;
+  uint8_t payload[sizeof(T)+parity+1];
+  sender(T *data, uint8_t r,
+  uint8_t maxQ): 
+    sentData(data),
+    dataLen(sizeof(T)),
+    reg(r),
+    timeout(timeOnAir_ms(SF, 62.5E3, CR-4, parity+sizeof(T)+1, true, true, 32) * FREETIME),
+    maxQuenue(maxQ){}
 };
 
 struct device{
   uint8_t flagpos=0;
   bool OK=false;
+  bool busy=false;
   unsigned long last=0;
   unsigned long timeout=1000;
 };
@@ -108,7 +146,6 @@ struct sensor3d{
   sensor1d x;
   sensor1d y;
   sensor1d z;
-  
   float t0=0;
 };
 struct calibrationInfo{
@@ -120,31 +157,49 @@ struct calibrationInfo{
   sensor3d mag;
 };
 
-SensorData data;
+ScientificData allData;
+TechnicalData additData;
+
+sender<ScientificData, 8> sciSender(&allData, 0x01, 0);
+sender<TechnicalData, 8> additSender(&additData, 0x08, 4);
+
 calibrationInfo calibrator;
 SystemInfo check;
 
 char row[2048];
-uint8_t payload[sizeof(SensorData) + 2];
 uint8_t pmsBuffer[32];
 
 const char* number = "+359892777567";
 
-unsigned int timeOnAir_ms(uint8_t sf, float bw, uint8_t cr, int len, bool header, bool crc) { // calculate time-on-air in milliseconds for LoRa packet 
-  double ts = (double)(1 << sf) / bw * 1000; // symbol duration in ms 
-  double pl = len + (header ? 0 : 4); 
-  double nPayload = 8 + std::max( ceil((8 * pl - 4 * sf + 28 + 16 * crc - 20) / (double)(4 * (sf - 2))) * (cr + 4), 0.0 ); 
-  double tOnAir = (12.25 + nPayload) * ts; 
-  return (unsigned int)ceil(tOnAir); 
-}
-void generatePayload(uint8_t *payload) {
-  payload[0] = 0xAA;  // стартовый байт
-
-  memcpy(&payload[1], &data, sizeof(SensorData));
-
-  payload[1 + sizeof(SensorData)] = 0xBB;  // конечный байт
+uint8_t changeBit(uint8_t flags,uint8_t flagpos,bool valu){
+  return (flags & ~(1 << flagpos)) | (uint8_t(valu) << flagpos);
 }
 
+
+uint8_t payload[sizeof(ScientificData)];
+
+template<typename T,uint8_t parity>
+void generatePayload(sender<T, parity> &Sender);
+
+template<typename T,uint8_t parity>
+void generatePayload(sender<T, parity> &Sender){
+  
+  uint8_t inputWorkBuffer[Sender.dataLen];
+  
+  // 2. Clear the buffer safely
+  memset(inputWorkBuffer, 0, Sender.dataLen);
+  
+  // 3. Copy the raw data from your struct pointer (*sentData) into the working buffer
+  memcpy(inputWorkBuffer, Sender.sentData, Sender.dataLen);
+
+  // 4. Encode using the Reed-Solomon instance inside that specific sender.
+  // This calculates the error-correction parity bytes and writes everything into Sender.payload
+  Sender.rs.Encode(inputWorkBuffer, &Sender.payload[1]);
+  Sender.payload[0]=Sender.reg;
+  // Optional: Debug print to verify total packet size (Data bytes + Parity bytes)
+  Serial.print("Payload generated. Total size: ");
+  Serial.println(Sender.dataLen + Sender.par);
+}
 int calibrate(sensor1d dataset, float value,float multiplier=1,float t=-300){
   if(t!=-300)return (value-dataset.offset-dataset.tempOffset*(t-dataset.t0))*dataset.scale;
   return (int)((value-dataset.offset)*dataset.scale*multiplier);
@@ -153,14 +208,18 @@ int calibrate(sensor1d dataset, int value,float multiplier=1,float t=-300){
   if(t!=-300)return (int)((value-dataset.offset-dataset.tempOffset*(t-dataset.t0))*dataset.scale);
   return (int)((value-dataset.offset)*dataset.scale*multiplier);
 }
+
 bool i2cDevicePresent(uint8_t address) {
     Wire.beginTransmission(address);
     return (Wire.endTransmission() == 0);
 }
+
 void checkI2CDevices() {
     check.gyro.OK = check.gyro.OK && i2cDevicePresent(0x68);
+    additData.flags=changeBit(additData.flags,check.gyro.flagpos,check.gyro.OK);
     check.BMP.OK = check.BMP.OK && i2cDevicePresent(0x77);
     check.AHT.OK =check.AHT.OK && i2cDevicePresent(0x38);
+    additData.flags=changeBit(additData.flags,check.AHT.flagpos,check.AHT.OK);
     check.mag.OK =check.mag.OK && i2cDevicePresent(0x1E);
 }
 
@@ -171,13 +230,14 @@ bool readPMSFrame(Stream &serial, uint8_t *buffer) { // Чтение 32 байт
       for (int i = 2; i < 32; i++) { 
         if (serial.available() == 0) return false;
           buffer[i] = serial.read();} 
-        data.pm1_0 = (buffer[10] << 8) | buffer[11];
-        data.pm2_5 = (buffer[12] << 8) | buffer[13];
-        data.pm10_0 = (buffer[14] << 8) | buffer[15];
-        data.p03um = (buffer[16] << 8) | buffer[17];
-        data.p05um = (buffer[18] << 8) | buffer[19];
-        data.p10um = (buffer[20] << 8) | buffer[21];
+        allData.pm1_0 = (buffer[10] << 8) | buffer[11];
+        allData.pm2_5 = (buffer[12] << 8) | buffer[13];
+        allData.pm10_0 = (buffer[14] << 8) | buffer[15];
+        allData.p03um = (buffer[16] << 8) | buffer[17];
+        allData.p05um = (buffer[18] << 8) | buffer[19];
+        allData.p10um = (buffer[20] << 8) | buffer[21];
         check.pms.OK=true;
+        additData.flags=changeBit(additData.flags,check.pms.flagpos,check.pms.OK);
         check.pms.last=millis();
         return true;
     }
@@ -185,74 +245,77 @@ bool readPMSFrame(Stream &serial, uint8_t *buffer) { // Чтение 32 байт
   if(millis()-check.pms.last>check.pms.timeout){
     check.pms.last=millis();
     check.pms.OK=false;
+    additData.flags=changeBit(additData.flags,check.pms.flagpos,check.pms.OK);
     pmsConnect();
   }
-  return false; }
+  return false; 
+}
 
-void dataToJson(SensorData data,char buffer[],int len){
+void dataToJson(ScientificData allData, TechnicalData additData,char buffer[],int len){
   int i=0;
   snprintf(buffer, len,
-    "{\"%s\":%d,\"%s\":%d,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%lu,"
+    "{\"%s\":%d,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%lu,"
     "\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,"
     "\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.3f,\"%s\":%d,"
     "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%.9f,\"%s\":%.9f,"
     "\"%s\":%d,\"%s\":%d,\"%s\":%d}\n",
-    labels[i++],data.now,labels[i++],data.UT_seconds,
-    labels[i++],(float)data.AHT_temp/100,labels[i++],(float)data.AHT_hum/100,
-    labels[i++],(float)data.BMP_temp/100,labels[i++],(long)data.BMP_pres*10,
-    labels[i++],(float)data.gyro.x/100,labels[i++],(float)data.gyro.y/100,labels[i++],(float)data.gyro.z/100,
-    labels[i++],(float)data.accel.x/1000,labels[i++],(float)data.accel.y/1000,labels[i++],(float)data.accel.z/1000,
-    labels[i++],(float)data.gtemp/100,
-    labels[i++],(float)data.mag.x/100,labels[i++],(float)data.mag.y/100,labels[i++],(float)data.mag.z/100,
-    labels[i++],(float)data.volt/1000,
-    labels[i++],data.pm1_0,labels[i++], data.pm2_5,labels[i++], data.pm10_0,
-    labels[i++],data.p03um, labels[i++],data.p05um, labels[i++],data.p10um,
-    labels[i++],data.lat,
-    labels[i++],data.lon,
-    labels[i++],data.altitude,
-    labels[i++],data.q2G,
-    labels[i++],data.flags);
+    labels[i++],allData.now,
+    labels[i++],(float)allData.AHT_temp/100,labels[i++],(float)allData.AHT_hum/100,
+    labels[i++],(float)allData.BMP_temp/100,labels[i++],(long)allData.BMP_pres*10,
+    labels[i++],(float)additData.gyro.x/100,labels[i++],(float)additData.gyro.y/100,labels[i++],(float)additData.gyro.z/100,
+    labels[i++],(float)additData.accel.x/1000,labels[i++],(float)additData.accel.y/1000,labels[i++],(float)additData.accel.z/1000,
+    labels[i++],(float)additData.gtemp/100,
+    labels[i++],(float)additData.mag.x/100,labels[i++],(float)additData.mag.y/100,labels[i++],(float)additData.mag.z/100,
+    labels[i++],(float)additData.volt/1000,
+    labels[i++],allData.pm1_0,labels[i++], allData.pm2_5,labels[i++], allData.pm10_0,
+    labels[i++],allData.p03um, labels[i++],allData.p05um, labels[i++],allData.p10um,
+    labels[i++],allData.lat,
+    labels[i++],allData.lon,
+    labels[i++],allData.altitude,
+    labels[i++],additData.q2G,
+    labels[i++],additData.flags);
 }
-void dataToCsv(SensorData data, char buffer[], int len) {
+
+void dataToCsv(ScientificData allData, TechnicalData additData, char buffer[], int len) {
     snprintf(buffer, len,
-    "%u,%u,%.2f,%.2f,%.2f,%lu,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%.3f,%u,%u,%u,%u,%u,%u,%.9f,%.9f,%d,%d,%d\n",
-    data.now, 
-    data.UT_seconds,
-    (float)data.AHT_temp / 100.0, 
-    (float)data.AHT_hum / 100.0,
-    (float)data.BMP_temp / 100.0, 
-    (long)data.BMP_pres*10,
-    (float)data.gyro.x / 100.0, 
-    (float)data.gyro.y / 100.0, 
-    (float)data.gyro.z / 100.0,
-    (float)data.accel.x / 1000.0, 
-    (float)data.accel.y / 1000.0, 
-    (float)data.accel.z / 1000.0,
-    (float)data.gtemp / 100.0,
-    (float)data.mag.x / 100.0, 
-    (float)data.mag.y / 100.0, 
-    (float)data.mag.z / 100.0,
-    (float)data.volt / 1000.0,
-    data.pm1_0, 
-    data.pm2_5, 
-    data.pm10_0,
-    data.p03um, 
-    data.p05um, 
-    data.p10um,
-    data.lat,
-    data.lon,
-    data.altitude,
-    data.q2G,
-    data.flags
+    "%u,%.2f,%.2f,%.2f,%lu,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%.3f,%u,%u,%u,%u,%u,%u,%.9f,%.9f,%d,%d,%d\n",
+    allData.now, 
+    (float)allData.AHT_temp / 100.0, 
+    (float)allData.AHT_hum / 100.0,
+    (float)allData.BMP_temp / 100.0, 
+    (long)allData.BMP_pres*10,
+    (float)additData.gyro.x / 100.0, 
+    (float)additData.gyro.y / 100.0, 
+    (float)additData.gyro.z / 100.0,
+    (float)additData.accel.x / 1000.0, 
+    (float)additData.accel.y / 1000.0, 
+    (float)additData.accel.z / 1000.0,
+    (float)additData.gtemp / 100.0,
+    (float)additData.mag.x / 100.0, 
+    (float)additData.mag.y / 100.0, 
+    (float)additData.mag.z / 100.0,
+    (float)additData.volt / 1000.0,
+    allData.pm1_0, 
+    allData.pm2_5, 
+    allData.pm10_0,
+    allData.p03um, 
+    allData.p05um, 
+    allData.p10um,
+    allData.lat,
+    allData.lon,
+    allData.altitude,
+    additData.q2G,
+    additData.flags
   );
 }
+
 void sdConnect(){
-  Serial.println("sd connect");
   check.SD.OK=SD.begin(SD_CS);
+  additData.flags=changeBit(additData.flags,check.SD.flagpos,check.SD.OK);
   if(check.SD.OK){
     check.SD.last=millis();
-    if (!SD.exists("/data.csv")) {
-      File file = SD.open("/data.csv",FILE_WRITE);
+    if (!SD.exists("/allData.csv")) {
+      File file = SD.open("/allData.csv",FILE_WRITE);
       if(file){
         for(int i=0;i<sizeof(labels)/sizeof(labels[0]);i++){
           file.print(labels[i]);
@@ -264,117 +327,178 @@ void sdConnect(){
   }
 }
 
+// -------------------------------------------------------------
+// ИСПРАВЛЕНО: LoRaConnect и LoRaCheck
+// -------------------------------------------------------------
 void LoRaConnect(){
-  Serial.println("lora connect");
+  digitalWrite(CS_PIN, HIGH); // Гарантируем отключение SPI-устройства перед сбросом
+  
   digitalWrite(RST, LOW);
   delay(10);
   digitalWrite(RST, HIGH);
-  check.LoRa.OK=LoRa.begin(433E6);
+  delay(10); // ВАЖНО: Даем время LoRa-модулю на аппаратную инициализацию
+  
+  check.LoRa.OK = LoRa.begin(433E6);
+  additData.flags=changeBit(additData.flags,check.LoRa.flagpos,check.LoRa.OK);
+  
   if(check.LoRa.OK){
-    check.LoRa.last=millis();
-    LoRa.setSpreadingFactor(12);
+    check.LoRa.last = millis();
+    LoRa.setSpreadingFactor(SF);
     LoRa.setSignalBandwidth(62.5E3);
-    LoRa.setCodingRate4(8);
-    LoRa.setTxPower(20);}
+    LoRa.setCodingRate4(CR);
+    LoRa.setTxPower(20);
+    LoRa.setPreambleLength(32);
+  }
+  check.LoRa.busy=false;
 }
+
 void LoRaCheck(){
   uint8_t version = 0;
+  
+  // ВАЖНО: Отключаем SD-карту от шины перед ручной проверкой LoRa
+  digitalWrite(SD_CS, HIGH); 
   
   // Start SPI manual transaction
   SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
   digitalWrite(CS_PIN, LOW);
   // Send 0x42 (Version Register).
   // In SPI, the 8th bit is 0 for Read, 1 for Write.
-  SPI.transfer(0x42 & 0x7F); 
+  SPI.transfer(0x42 & 0x7F);
   version = SPI.transfer(0x00); // Read the result
   
   digitalWrite(CS_PIN, HIGH);
   SPI.endTransaction();
-  if(version!=0x12){
-  check.LoRa.OK=false;}}
+  
+  if(version != 0x12){
+    check.LoRa.OK = false;
+    check.LoRa.busy=false;
+    additData.flags=changeBit(additData.flags,check.LoRa.flagpos,check.LoRa.OK);
+  }
+}
+bool checkSent() {
+  uint8_t irqFlags = 0;
+  digitalWrite(SD_CS, HIGH); 
+
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(CS_PIN, LOW);
+  SPI.transfer(0x12 & 0x7F);
+  irqFlags = SPI.transfer(0x00);
+  digitalWrite(CS_PIN, HIGH);
+  SPI.endTransaction();
+
+  // Если шина выдает 0xFF — модуль физически отключился или завис
+  if (irqFlags == 0xFF){
+    check.LoRa.OK = false;
+    check.LoRa.busy = false;
+    return true;}
+
+  // Если пакет ушел (бит 3 установлен)
+  if (irqFlags & 0x08) {
+    SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(CS_PIN, LOW);
+    SPI.transfer(0x12 | 0x80);
+    SPI.transfer(0x08); // Очистка флага TxDone
+    digitalWrite(CS_PIN, HIGH);
+    SPI.endTransaction();
+    LoRa.idle(); 
+    check.LoRa.busy = false;
+    return false; // Успех
+  }
+  return true; // Все еще передает
+}
+
 void ahtConnect(){
-  Serial.println("aht connect");
   check.AHT.last=millis();
   if(i2cDevicePresent(0x38))check.AHT.OK=aht.begin();
-  else Serial.println("aht not found");
+  additData.flags=changeBit(additData.flags,check.AHT.flagpos,check.AHT.OK);
 }
+
 void bmpConnect(){
-  Serial.println("bmp connect");
   check.BMP.last=millis();
   if(i2cDevicePresent(0x77))check.BMP.OK=bmp280.begin()==0;
-  else Serial.println("bmp not found");
 }
+
 void accelConnect(){
-  Serial.println("accel connect");
   check.gyro.last=millis();
   if(i2cDevicePresent(0x68)){
     check.gyro.OK=sensor.wakeup();
+    additData.flags=changeBit(additData.flags,check.gyro.flagpos,check.gyro.OK);
     if(check.gyro.OK) {
       sensor.setAccelSensitivity(0);  //  2g
       sensor.setGyroSensitivity(0);   //  250 degrees/s
       sensor.setThrottle();
     }
-  }else Serial.println("accel not found");
+  }
 }
+
 void magnConnect() {
-  Serial.println("HMC5883L connect...");
   check.mag.last = millis();
   check.mag.OK =mag.begin();
 }
+
 void startI2CDevices(){
   delay(500);
   Wire.begin();
+  Wire.setTimeOut(1000);
   ahtConnect();
   bmpConnect();
   accelConnect();
   magnConnect();
 }
+
 void pmsConnect(){
   Serial.end();
-  delay(500);
+  delay(400);
   Serial.begin(9600);
+  Serial.setTimeout(100);
   check.pms.last=millis();
-  Serial.println("pms connect");
+  //Serial.println("pms connect");
 }
+
 void gpsConnect(){
-  Serial.println("gps connect");
   Serial1.end();
   delay(100);
   Serial1.begin(9600, SERIAL_8N1, RXD1, TXD1);
+  Serial1.setTimeout(100);
   check.GPS.last=millis();
   delay(50);
   Serial1.write(GPSsettings,sizeof(GPSsettings));
 }
+
 bool readGPSFrame(Stream &serial){
   if(serial.available()){
     while (serial.available()) {
       gps.encode(serial.read());
       check.GPS.last=millis();
-      check.GPS.OK=true;}
+      check.GPS.OK=true;
+      additData.flags=changeBit(additData.flags,check.GPS.flagpos,check.GPS.OK);}
     if (gps.location.isValid()) {
-      data.lat = gps.location.lat();
-      data.lon = gps.location.lng();}
+      allData.lat = gps.location.lat();
+      allData.lon = gps.location.lng();}
     if (gps.altitude.isValid()){
-      data.altitude = (uint16_t)gps.altitude.meters();}
-    if (gps.time.isValid()){
-      data.UT_seconds=gps.time.second()+gps.time.minute()*60+gps.time.hour()*3600;
-    }
+      allData.altitude = (uint16_t)gps.altitude.meters();}
+//    if (gps.time.isValid()){
+//      allData.UT_seconds=gps.time.second()+gps.time.minute()*60+gps.time.hour()*3600;
+//    }
   }
   if(millis()-check.GPS.last>check.GPS.timeout){
     check.GPS.last=millis();
     check.GPS.OK=false;
+    additData.flags=changeBit(additData.flags,check.GPS.flagpos,check.GPS.OK);
     gpsConnect();
   }
   return check.GPS.OK;
 }
+
 void smsConnect(){
-  Serial.println("sms connect");
   Serial2.end();
   delay(50);
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  Serial2.setTimeout(200);
   delay(100);
   checkSMS(Serial2);
 }
+
 bool checkSMS(Stream &serial){
   while(serial.available())serial.read();
   serial.println("AT");
@@ -382,11 +506,14 @@ bool checkSMS(Stream &serial){
   check.SMS.last=millis();
     if(serial.readString().indexOf("OK")!=-1){
       check.SMS.OK=true;
+      additData.flags=changeBit(additData.flags,check.SMS.flagpos,check.SMS.OK);
       return true;}
   
   check.SMS.OK=false;
+  additData.flags=changeBit(additData.flags,check.SMS.flagpos,check.SMS.OK);
   return false;
 }
+
 int get2gQuality(Stream &serial){
   while(serial.available())serial.read();
   serial.println("AT+CSQ");
@@ -401,33 +528,49 @@ int get2gQuality(Stream &serial){
   return (int) calibrate(calibrator.q2G,(int)output.toInt());}
   return 0;
 }
+
 void sendSMS(Stream &serial) {
   if(checkSMS(serial)){
-      data.q2G=get2gQuality(serial);
+      additData.q2G=get2gQuality(serial);
       serial.println("AT+CMGF=1");
       delay(50);
       serial.print("AT+CMGS=\"");
       serial.print(number);
       serial.println("\"");
       delay(50);
-      dataToJson(data,row,sizeof(row));
+      dataToJson(allData,additData,row,sizeof(row));
       serial.print(row);
       serial.write(26);
   }else smsConnect();
 }
 
 void setup() {
+  esp_task_wdt_config_t twdt_config = {
+    .timeout_ms = 5000,
+    .idle_core_mask = (1<<0),
+    .trigger_panic = true};
+  esp_task_wdt_reconfigure(&twdt_config);
+  esp_task_wdt_add(NULL);
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN);
+  
+  // -------------------------------------------------------------
+  // ИСПРАВЛЕНО: Жёсткая инициализация пинов CS
+  // -------------------------------------------------------------
+  pinMode(CS_PIN, OUTPUT);
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(CS_PIN, HIGH);
+  digitalWrite(SD_CS, HIGH);
+  // -------------------------------------------------------------
   
   startI2CDevices();
   
   pinMode(HOT_PIN, OUTPUT);
 
   LoRa.setPins(CS_PIN, RST, DIO0);
-  check.LoRa.timeout=timeOnAir_ms(12, 62.5E3, 8-4, sizeof(payload), true, true);
+  check.LoRa.timeout=0;
   check.SMS.timeout=5000;
   check.GPS.timeout=5000;
   check.pms.timeout=5000;
@@ -435,6 +578,15 @@ void setup() {
   check.BMP.timeout=1000;
   check.gyro.timeout=1000;
   check.mag.timeout=1000;
+
+  check.termo.flagpos=0;
+  check.LoRa.flagpos=1;
+  check.GPS.flagpos=2;
+  check.SMS.flagpos=3;
+  check.SD.flagpos=4;
+  check.pms.flagpos=5;
+  check.gyro.flagpos=6;
+  check.AHT.flagpos=7; 
   
   calibrator.gyro.x.offset=2.336;
   calibrator.gyro.y.offset=2.351;
@@ -451,13 +603,12 @@ void setup() {
   calibrator.volt.scale=3.10/4095;
   calibrator.volt.offset=-0.97*4095/3.10;
   
-  calibrator.q2G.scale=2;
-  calibrator.q2G.offset=113/2;
-  check.termo.targetTemp=30;
+  calibrator.q2G.scale=1;
+  calibrator.q2G.offset=0;
+  check.termo.targetTemp=0;
   check.termo.tempThreshold=2;
-  check.termo.minVoltage=3.1;
+  check.termo.minVoltage=0;
   check.termo.voltThreshold=0.2;
-  
   
   gpsConnect();
   pmsConnect();
@@ -477,44 +628,47 @@ void loop() {
   
   if(check.gyro.OK){
       sensor.read();
-      data.accel.x = calibrate(calibrator.accel.x,sensor.getAccelX(),1000);
-      data.accel.y = calibrate(calibrator.accel.y,sensor.getAccelY(),1000);
-      data.accel.z = calibrate(calibrator.accel.z,sensor.getAccelZ(),1000);
-      data.gyro.x = calibrate(calibrator.gyro.x,sensor.getGyroX(),100);
-      data.gyro.y = calibrate(calibrator.gyro.y,sensor.getGyroY(),100);
-      data.gyro.z = calibrate(calibrator.gyro.z,sensor.getGyroZ(),100);
+      additData.accel.x = calibrate(calibrator.accel.x,sensor.getAccelX(),1000);
+      additData.accel.y = calibrate(calibrator.accel.y,sensor.getAccelY(),1000);
+      additData.accel.z = calibrate(calibrator.accel.z,sensor.getAccelZ(),1000);
+      additData.gyro.x = calibrate(calibrator.gyro.x,sensor.getGyroX(),100);
+      additData.gyro.y = calibrate(calibrator.gyro.y,sensor.getGyroY(),100);
+      additData.gyro.z = calibrate(calibrator.gyro.z,sensor.getGyroZ(),100);
   
-      data.gtemp = calibrate(calibrator.gtemp,sensor.getTemperature(),100);
+      additData.gtemp = calibrate(calibrator.gtemp,sensor.getTemperature(),100);
       
       check.gyro.last=millis();
   }
   else if (millis()-check.gyro.last>check.gyro.timeout){
     accelConnect();
   }
+  
   if(check.AHT.OK){
     sensors_event_t humidity, temp;
     aht.getEvent(&humidity, &temp);
-    data.AHT_temp = temp.temperature*100;
-    data.AHT_hum = humidity.relative_humidity*100;
+    allData.AHT_temp = temp.temperature*100;
+    allData.AHT_hum = humidity.relative_humidity*100;
   }
   else if (millis()-check.AHT.last>check.AHT.timeout){
     ahtConnect();
   }
+  
   if(check.BMP.OK){
-    data.BMP_temp = bmp280.getTemperature()*100;
-    data.BMP_pres = bmp280.getPressure()/10;
+    allData.BMP_temp = bmp280.getTemperature()*100;
+    allData.BMP_pres = bmp280.getPressure()/10;
   }
   else if (millis()-check.BMP.last>check.BMP.timeout){
     bmpConnect();
   }
+  
   if(check.mag.OK){
       sensors_event_t event; 
       if (mag.getEvent(&event)) {
-        data.mag.x=calibrate(calibrator.mag.x,event.magnetic.x,100);
-        data.mag.y=calibrate(calibrator.mag.y,event.magnetic.y,100);
-        data.mag.z=calibrate(calibrator.mag.z,event.magnetic.z,100);}
+        additData.mag.x=calibrate(calibrator.mag.x,event.magnetic.x,100);
+        additData.mag.y=calibrate(calibrator.mag.y,event.magnetic.y,100);
+        additData.mag.z=calibrate(calibrator.mag.z,event.magnetic.z,100);}
       else {
-        check.mag.OK = false; // Mark as failed if the library returns false
+        check.mag.OK = false;
       }
       check.mag.last=millis();
   }
@@ -522,31 +676,14 @@ void loop() {
     magnConnect();
   }
 
-  data.volt =calibrate(calibrator.volt,analogRead(TEST_PIN),1000);
+  additData.volt =calibrate(calibrator.volt,analogRead(TEST_PIN),1000);
   
+  allData.now=millis();
   
-//  if (data.gtemp < check.termo.targetTemp-check.termo.tempThreshold && data.volt/1000 > check.termo.minVoltage+check.termo.voltThreshold)
-//  { check.termo.isOn=true;
-//    digitalWrite(HOT_PIN,HIGH);}
-//  else if(data.gtemp > check.termo.targetTemp || data.volt/1000 < check.termo.minVoltage){
-//    check.termo.isOn=false;
-//    digitalWrite(HOT_PIN,LOW);}
+  dataToCsv(allData,additData,row,sizeof(row));
   
-  
-  data.now=millis();
-  if(data.now%2000>1000){
-    check.termo.isOn=true;
-    digitalWrite(HOT_PIN,HIGH);
-  }
-  else{
-    check.termo.isOn=false;
-    digitalWrite(HOT_PIN,LOW);
-  }
-  data.flags=(data.flags & ~(1 << check.termo.flagpos)) | (uint8_t(check.termo.isOn) << check.termo.flagpos);
-  
-  dataToCsv(data,row,sizeof(row));
   if(check.SD.OK){
-    File file = SD.open("/data.csv", FILE_APPEND);
+    File file = SD.open("/allData.csv", FILE_APPEND);
     if (file) {
       check.SD.last=millis();
       file.print(row);
@@ -554,23 +691,66 @@ void loop() {
       check.SD.last=millis();
     }else{
       check.SD.OK=false;
+      additData.flags=changeBit(additData.flags,check.SD.flagpos,check.SD.OK);
     }
   }else sdConnect();
-  dataToJson(data,row,sizeof(row));
-  Serial.print(row);
+  
+  dataToJson(allData,additData,row,sizeof(row));
+  //Serial.print(row);
+  
   if (millis() - check.SMS.last> check.SMS.timeout) {
     sendSMS(Serial2);
   }
+  if(check.LoRa.OK && check.LoRa.busy){
+    checkSent();}
   if(millis() - check.LoRa.last > check.LoRa.timeout){
-  LoRaCheck();
-  if (check.LoRa.OK) {
-    generatePayload(payload);
-    LoRa.beginPacket();
-    LoRa.write(payload, 1 + sizeof(SensorData) + 1);
-    LoRa.endPacket(true);
+    LoRaCheck();
+    if(check.LoRa.busy){
+      check.LoRa.OK=false;}
+    if (check.LoRa.OK) {
+      Serial.println(additSender.quenue);
+      Serial.println(sciSender.quenue);
+      
+      Serial.println(check.LoRa.timeout);
+      if(additSender.quenue>=additSender.maxQuenue)
+      {
+        Serial.println("");
+        Serial.println("addit sender");
+        sciSender.quenue++;
+        additSender.quenue=0;
+        generatePayload(additSender);
+        check.LoRa.timeout=additSender.timeout;
+        LoRa.beginPacket();
+        LoRa.write(additSender.payload, additSender.par+additSender.dataLen+1);
+        LoRa.endPacket(true);
+      }else if(sciSender.quenue>=sciSender.maxQuenue)
+      {
+        additSender.quenue++;
+        sciSender.quenue=0;
+        Serial.println("");
+        Serial.println("sci sender");
+        generatePayload(sciSender);
+        check.LoRa.timeout=sciSender.timeout;
+        LoRa.beginPacket();
+        LoRa.write(sciSender.payload, sciSender.par+sciSender.dataLen+1);
+        LoRa.endPacket(true); 
+      }
+      check.LoRa.busy=true;
+      
+      if (additData.gtemp < check.termo.targetTemp-check.termo.tempThreshold && additData.volt/1000 > check.termo.minVoltage+check.termo.voltThreshold && check.gyro.OK) { 
+        check.termo.isOn=true;
+        digitalWrite(HOT_PIN,HIGH);
+      } else if((additData.gtemp > check.termo.targetTemp || additData.volt/1000 < check.termo.minVoltage) || !check.gyro.OK){
+        check.termo.isOn=false;
+        digitalWrite(HOT_PIN,LOW);
+      }
+      additData.flags=changeBit(additData.flags,check.termo.flagpos,check.termo.isOn);
+    } else {
+      LoRaConnect();
+    }
+    
+    check.LoRa.last=millis();
   }
-  else{
-    LoRaConnect();
-  }
-  check.LoRa.last=millis();}
+  
+  esp_task_wdt_reset();
 }
