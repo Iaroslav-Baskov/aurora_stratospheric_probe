@@ -29,10 +29,13 @@
 
 #define HOT_PIN   32
 #define TEST_PIN  35
+#define CAM_PIN   13
 
 #define SF 12
-#define CR 8
+#define CR 4
 #define FREETIME 10
+#define BW 62500.0
+#define REG_MODEM_CONFIG3  0x26
 
 Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
 GY521 sensor(0x68);
@@ -101,7 +104,7 @@ struct sender{
   T *sentData;
   uint8_t dataLen;
   uint8_t reg;
-  uint8_t timeout;
+  unsigned long timeout;
   uint8_t quenue=0;
   uint8_t maxQuenue;
   RS::ReedSolomon<sizeof(T),parity> rs;
@@ -112,7 +115,7 @@ struct sender{
     sentData(data),
     dataLen(sizeof(T)),
     reg(r),
-    timeout(timeOnAir_ms(SF, 62.5E3, CR-4, parity+sizeof(T)+1, true, true, 32) * FREETIME),
+    timeout(timeOnAir_ms(SF, BW, CR-4, parity+sizeof(T)+1, true, true, 62) * FREETIME),
     maxQuenue(maxQ){}
 };
 
@@ -127,6 +130,7 @@ struct heatDevice{
   uint8_t flagpos=0;
   bool isOn=false;
   unsigned long last=0;
+  unsigned long timeout=1000;
   float targetTemp=0;
   float tempThreshold=0;
   float minVoltage=0;
@@ -135,6 +139,7 @@ struct heatDevice{
 struct SystemInfo {
   device SD,LoRa,SMS,pms,AHT,BMP,gyro,mag,GPS;
   heatDevice termo;
+  heatDevice cam;
 };
 struct sensor1d{
   float offset=0;
@@ -169,7 +174,8 @@ SystemInfo check;
 char row[2048];
 uint8_t pmsBuffer[32];
 
-const char* number = "+359892777567";
+//const char* number = "+359892777567";
+const char* number = "+359877914275";
 
 uint8_t changeBit(uint8_t flags,uint8_t flagpos,bool valu){
   return (flags & ~(1 << flagpos)) | (uint8_t(valu) << flagpos);
@@ -197,6 +203,7 @@ void generatePayload(sender<T, parity> &Sender){
   Sender.rs.Encode(inputWorkBuffer, &Sender.payload[1]);
   Sender.payload[0]=Sender.reg;
   // Optional: Debug print to verify total packet size (Data bytes + Parity bytes)
+  
   Serial.print("Payload generated. Total size: ");
   Serial.println(Sender.dataLen + Sender.par);
 }
@@ -219,7 +226,6 @@ void checkI2CDevices() {
     additData.flags=changeBit(additData.flags,check.gyro.flagpos,check.gyro.OK);
     check.BMP.OK = check.BMP.OK && i2cDevicePresent(0x77);
     check.AHT.OK =check.AHT.OK && i2cDevicePresent(0x38);
-    additData.flags=changeBit(additData.flags,check.AHT.flagpos,check.AHT.OK);
     check.mag.OK =check.mag.OK && i2cDevicePresent(0x1E);
 }
 
@@ -254,7 +260,7 @@ bool readPMSFrame(Stream &serial, uint8_t *buffer) { // Чтение 32 байт
 void dataToJson(ScientificData allData, TechnicalData additData,char buffer[],int len){
   int i=0;
   snprintf(buffer, len,
-    "{\"%s\":%d,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%lu,"
+    "{\"%s\":%u,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%lu,"
     "\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.3f,\"%s\":%.3f,\"%s\":%.3f,"
     "\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.2f,\"%s\":%.3f,\"%s\":%d,"
     "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%.9f,\"%s\":%.9f,"
@@ -275,7 +281,18 @@ void dataToJson(ScientificData allData, TechnicalData additData,char buffer[],in
     labels[i++],additData.q2G,
     labels[i++],additData.flags);
 }
-
+void dataToSMS(ScientificData allData, TechnicalData additData,char buffer[],int len){
+  snprintf(buffer, len,
+    "{\"%s\":%u,\"%s\":%.2f,\"%s\":%.3f,\"%s\":%.7f,\"%s\":%.7f,\"%s\":%d,\"%s\":%d,\"%s\":%d,\n",
+    labels[0],allData.now,
+    labels[11],(float)additData.gtemp/100,
+    labels[15],(float)additData.volt/1000,
+    labels[22],allData.lat,
+    labels[23],allData.lon,
+    labels[24],allData.altitude,
+    labels[25],additData.q2G,
+    labels[26],additData.flags);
+}
 void dataToCsv(ScientificData allData, TechnicalData additData, char buffer[], int len) {
     snprintf(buffer, len,
     "%u,%.2f,%.2f,%.2f,%lu,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%.3f,%u,%u,%u,%u,%u,%u,%.9f,%.9f,%d,%d,%d\n",
@@ -330,6 +347,19 @@ void sdConnect(){
 // -------------------------------------------------------------
 // ИСПРАВЛЕНО: LoRaConnect и LoRaCheck
 // -------------------------------------------------------------
+uint8_t readRegister(uint8_t address) {
+  digitalWrite(CS_PIN, LOW);
+  SPI.transfer(address & 0x7F);
+  uint8_t value = SPI.transfer(0);
+  digitalWrite(CS_PIN, HIGH);
+  return value;
+}
+void writeRegister(uint8_t address, uint8_t value) {
+  digitalWrite(CS_PIN, LOW);
+  SPI.transfer(address | 0x80);
+  SPI.transfer(value);
+  digitalWrite(CS_PIN, HIGH);
+}
 void LoRaConnect(){
   digitalWrite(CS_PIN, HIGH); // Гарантируем отключение SPI-устройства перед сбросом
   
@@ -344,10 +374,22 @@ void LoRaConnect(){
   if(check.LoRa.OK){
     check.LoRa.last = millis();
     LoRa.setSpreadingFactor(SF);
-    LoRa.setSignalBandwidth(62.5E3);
+    LoRa.setSignalBandwidth(BW);
     LoRa.setCodingRate4(CR);
-    LoRa.setTxPower(20);
-    LoRa.setPreambleLength(32);
+    LoRa.setTxPower(10);
+    LoRa.setPreambleLength(64);
+    
+    // LowDataRateOptimize для SF11+ и узкой полосы
+    uint8_t modemConfig3 = readRegister(REG_MODEM_CONFIG3);
+    modemConfig3 |= 0x01;  // LowDataRateOptimize = 1
+    modemConfig3 |= 0x02;  // AgcAutoOn = 1
+    writeRegister(REG_MODEM_CONFIG3, modemConfig3);
+
+        uint8_t checkLDRO = readRegister(REG_MODEM_CONFIG3);
+    Serial.print("LowDataRateOptimize: ");
+    Serial.println((checkLDRO & 0x01) ? "ON" : "OFF");
+    Serial.print("AgcAutoOn: ");
+    Serial.println((checkLDRO & 0x02) ? "ON" : "OFF");
   }
   check.LoRa.busy=false;
 }
@@ -410,7 +452,6 @@ bool checkSent() {
 void ahtConnect(){
   check.AHT.last=millis();
   if(i2cDevicePresent(0x38))check.AHT.OK=aht.begin();
-  additData.flags=changeBit(additData.flags,check.AHT.flagpos,check.AHT.OK);
 }
 
 void bmpConnect(){
@@ -538,7 +579,7 @@ void sendSMS(Stream &serial) {
       serial.print(number);
       serial.println("\"");
       delay(50);
-      dataToJson(allData,additData,row,sizeof(row));
+      dataToSMS(allData,additData,row,sizeof(row));
       serial.print(row);
       serial.write(26);
   }else smsConnect();
@@ -568,6 +609,7 @@ void setup() {
   startI2CDevices();
   
   pinMode(HOT_PIN, OUTPUT);
+  pinMode(CAM_PIN, OUTPUT);
 
   LoRa.setPins(CS_PIN, RST, DIO0);
   check.LoRa.timeout=0;
@@ -578,6 +620,8 @@ void setup() {
   check.BMP.timeout=1000;
   check.gyro.timeout=1000;
   check.mag.timeout=1000;
+  check.termo.timeout=30000;
+  check.cam.timeout=5*60*1000;
 
   check.termo.flagpos=0;
   check.LoRa.flagpos=1;
@@ -586,7 +630,7 @@ void setup() {
   check.SD.flagpos=4;
   check.pms.flagpos=5;
   check.gyro.flagpos=6;
-  check.AHT.flagpos=7; 
+  check.cam.flagpos=7;
   
   calibrator.gyro.x.offset=2.336;
   calibrator.gyro.y.offset=2.351;
@@ -605,10 +649,14 @@ void setup() {
   
   calibrator.q2G.scale=1;
   calibrator.q2G.offset=0;
+  
   check.termo.targetTemp=0;
-  check.termo.tempThreshold=2;
+  check.termo.tempThreshold=1;
   check.termo.minVoltage=0;
-  check.termo.voltThreshold=0.2;
+  check.termo.voltThreshold=0.01;
+  
+  check.cam.minVoltage=check.termo.minVoltage;
+  check.cam.voltThreshold=check.termo.voltThreshold;
   
   gpsConnect();
   pmsConnect();
@@ -676,10 +724,42 @@ void loop() {
     magnConnect();
   }
 
-  additData.volt =calibrate(calibrator.volt,analogRead(TEST_PIN),1000);
+  additData.volt = calibrate(calibrator.volt,analogRead(TEST_PIN),1000);
   
   allData.now=millis();
+  additData.now=millis();
+
+  if(millis()-check.termo.last>check.termo.timeout){
+    
+    if (additData.gtemp < (check.termo.targetTemp-check.termo.tempThreshold)*100 && additData.volt > (check.termo.minVoltage+check.termo.voltThreshold)*1000 && check.gyro.OK) { 
+      check.termo.isOn=true;
+      digitalWrite(HOT_PIN,HIGH);
+    } else if((additData.gtemp > check.termo.targetTemp *100 || additData.volt < check.termo.minVoltage*1000) || !check.gyro.OK){
+      check.termo.isOn=false;
+      digitalWrite(HOT_PIN,LOW);
+    }      
+    additData.flags=changeBit(additData.flags,check.termo.flagpos,check.termo.isOn);
+  }
   
+  if(millis()-check.cam.last>check.cam.timeout){
+//    if (additData.volt > (check.cam.minVoltage+check.cam.voltThreshold)*1000) { 
+//      check.cam.isOn=true;
+//      digitalWrite(CAM_PIN,HIGH);
+//    } else if(additData.volt < check.cam.minVoltage*1000){
+//      check.cam.isOn=false;
+//      digitalWrite(CAM_PIN,LOW);
+//    }
+    if (!check.cam.isOn) { 
+      check.cam.isOn=true;
+      digitalWrite(CAM_PIN,HIGH);
+    } else{
+      check.cam.isOn=false;
+      digitalWrite(CAM_PIN,LOW);
+    }
+    additData.flags=changeBit(additData.flags,check.cam.flagpos,check.cam.isOn);
+  }
+
+      
   dataToCsv(allData,additData,row,sizeof(row));
   
   if(check.SD.OK){
@@ -696,7 +776,7 @@ void loop() {
   }else sdConnect();
   
   dataToJson(allData,additData,row,sizeof(row));
-  //Serial.print(row);
+  Serial.print(row);
   
   if (millis() - check.SMS.last> check.SMS.timeout) {
     sendSMS(Serial2);
@@ -708,49 +788,45 @@ void loop() {
     if(check.LoRa.busy){
       check.LoRa.OK=false;}
     if (check.LoRa.OK) {
-      Serial.println(additSender.quenue);
-      Serial.println(sciSender.quenue);
       
-      Serial.println(check.LoRa.timeout);
       if(additSender.quenue>=additSender.maxQuenue)
       {
-        Serial.println("");
-        Serial.println("addit sender");
         sciSender.quenue++;
         additSender.quenue=0;
         generatePayload(additSender);
         check.LoRa.timeout=additSender.timeout;
+        Serial.println();
         LoRa.beginPacket();
         LoRa.write(additSender.payload, additSender.par+additSender.dataLen+1);
+        
+      for(int i=0;i<additSender.dataLen + additSender.par+1;i++){
+      Serial.printf("%02X", additSender.payload[i]);}
         LoRa.endPacket(true);
       }else if(sciSender.quenue>=sciSender.maxQuenue)
       {
         additSender.quenue++;
         sciSender.quenue=0;
-        Serial.println("");
-        Serial.println("sci sender");
         generatePayload(sciSender);
         check.LoRa.timeout=sciSender.timeout;
+        
+        Serial.println();
+        
         LoRa.beginPacket();
         LoRa.write(sciSender.payload, sciSender.par+sciSender.dataLen+1);
         LoRa.endPacket(true); 
+        
+      for(int i=0;i<sciSender.dataLen + sciSender.par+1;i++){
+      Serial.printf("%02X", sciSender.payload[i]);}
       }
+      
       check.LoRa.busy=true;
       
-      if (additData.gtemp < check.termo.targetTemp-check.termo.tempThreshold && additData.volt/1000 > check.termo.minVoltage+check.termo.voltThreshold && check.gyro.OK) { 
-        check.termo.isOn=true;
-        digitalWrite(HOT_PIN,HIGH);
-      } else if((additData.gtemp > check.termo.targetTemp || additData.volt/1000 < check.termo.minVoltage) || !check.gyro.OK){
-        check.termo.isOn=false;
-        digitalWrite(HOT_PIN,LOW);
-      }
-      additData.flags=changeBit(additData.flags,check.termo.flagpos,check.termo.isOn);
     } else {
       LoRaConnect();
     }
-    
     check.LoRa.last=millis();
   }
+  
   
   esp_task_wdt_reset();
 }
