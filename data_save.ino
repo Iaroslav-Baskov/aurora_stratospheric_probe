@@ -128,13 +128,20 @@ struct device{
 };
 struct heatDevice{
   uint8_t flagpos=0;
+  
   bool isOn=false;
   unsigned long last=0;
+  unsigned long lastSwitch=0;
+  
   unsigned long timeout=1000;
+  unsigned long workTime=0;
+  unsigned long sleepTime=0;
+  
   float targetTemp=0;
   float tempThreshold=0;
+  
   float minVoltage=0;
-  float voltThreshold;
+  float voltThreshold=0;
 };
 struct SystemInfo {
   device SD,LoRa,SMS,pms,AHT,BMP,gyro,mag,GPS;
@@ -376,7 +383,7 @@ void LoRaConnect(){
     LoRa.setSpreadingFactor(SF);
     LoRa.setSignalBandwidth(BW);
     LoRa.setCodingRate4(CR);
-    LoRa.setTxPower(10);
+    LoRa.setTxPower(20);
     LoRa.setPreambleLength(64);
     
     // LowDataRateOptimize для SF11+ и узкой полосы
@@ -610,6 +617,8 @@ void setup() {
   
   pinMode(HOT_PIN, OUTPUT);
   pinMode(CAM_PIN, OUTPUT);
+  digitalWrite(CAM_PIN,LOW);
+  digitalWrite(HOT_PIN,LOW);
 
   LoRa.setPins(CS_PIN, RST, DIO0);
   check.LoRa.timeout=0;
@@ -620,8 +629,6 @@ void setup() {
   check.BMP.timeout=1000;
   check.gyro.timeout=1000;
   check.mag.timeout=1000;
-  check.termo.timeout=30000;
-  check.cam.timeout=5*60*1000;
 
   check.termo.flagpos=0;
   check.LoRa.flagpos=1;
@@ -632,31 +639,39 @@ void setup() {
   check.gyro.flagpos=6;
   check.cam.flagpos=7;
   
-  calibrator.gyro.x.offset=2.336;
-  calibrator.gyro.y.offset=2.351;
-  calibrator.gyro.z.offset=-0.221;
-  calibrator.accel.x.offset=0.035378469830884045;
-  calibrator.accel.x.scale=10.01711296392382;
-  calibrator.accel.y.offset=-0.010919070720751357;
-  calibrator.accel.y.scale=9.854182783125843;
-  calibrator.accel.z.offset=-0.0060115734257293755;
-  calibrator.accel.z.scale=9.569241972040562;
-  calibrator.gtemp.offset=21.892719725589476;
-  calibrator.gtemp.scale=0.8899545931264473;
+  calibrator.gyro.x.offset=  2.336;
+  calibrator.gyro.y.offset=  2.351;
+  calibrator.gyro.z.offset= -0.221;
+  calibrator.accel.x.offset= 0.035378469830884045;
+  calibrator.accel.x.scale=  10.01711296392382;
+  calibrator.accel.y.offset= -0.010919070720751357;
+  calibrator.accel.y.scale=   9.854182783125843;
+  calibrator.accel.z.offset= -0.0060115734257293755;
+  calibrator.accel.z.scale=   9.569241972040562;
+  calibrator.gtemp.offset=    21.892719725589476;
+  calibrator.gtemp.scale=     0.8899545931264473;
 
-  calibrator.volt.scale=3.10/4095;
+  calibrator.volt.scale=  3.10/4095;
   calibrator.volt.offset=-0.97*4095/3.10;
   
-  calibrator.q2G.scale=1;
+  calibrator.q2G.scale= 1;
   calibrator.q2G.offset=0;
+
   
-  check.termo.targetTemp=0;
-  check.termo.tempThreshold=1;
-  check.termo.minVoltage=0;
-  check.termo.voltThreshold=0.01;
+  check.termo.targetTemp =    1;
+  check.termo.tempThreshold = 1;
+  check.termo.minVoltage =    3.041;
+  check.termo.voltThreshold = 0.0869;
+  check.termo.timeout =       100;
   
-  check.cam.minVoltage=check.termo.minVoltage;
-  check.cam.voltThreshold=check.termo.voltThreshold;
+  
+  check.cam.minVoltage =    3.041;
+  check.cam.voltThreshold = 0.0556;
+  check.cam.targetTemp =    50;
+  check.cam.tempThreshold = 10;
+  check.cam.timeout =       1*1000*60;
+  check.cam.workTime =      2*1000*60;
+  check.cam.sleepTime =     8*1000*60;
   
   gpsConnect();
   pmsConnect();
@@ -730,7 +745,7 @@ void loop() {
   additData.now=millis();
 
   if(millis()-check.termo.last>check.termo.timeout){
-    
+    check.termo.last=millis();
     if (additData.gtemp < (check.termo.targetTemp-check.termo.tempThreshold)*100 && additData.volt > (check.termo.minVoltage+check.termo.voltThreshold)*1000 && check.gyro.OK) { 
       check.termo.isOn=true;
       digitalWrite(HOT_PIN,HIGH);
@@ -742,20 +757,30 @@ void loop() {
   }
   
   if(millis()-check.cam.last>check.cam.timeout){
-//    if (additData.volt > (check.cam.minVoltage+check.cam.voltThreshold)*1000) { 
+    check.cam.last=millis();
+    if(check.cam.isOn==true && millis()-check.cam.lastSwitch>check.cam.workTime){
+      check.cam.isOn=false;
+      check.cam.lastSwitch=millis();
+    }
+    else{
+      if ((additData.gtemp < (check.cam.targetTemp-check.cam.tempThreshold)*100 || !check.gyro.OK) && additData.volt > (check.cam.minVoltage+check.cam.voltThreshold)*1000 && check.cam.isOn==false && (millis()-check.cam.lastSwitch>check.cam.sleepTime)) { 
+        check.cam.isOn=true;
+        check.cam.lastSwitch=millis();
+      } else if((additData.volt < check.cam.minVoltage*1000 || (additData.gtemp > (check.cam.targetTemp)*100 && check.gyro.OK)) && check.cam.isOn){
+        check.cam.isOn=false;
+        check.cam.lastSwitch=millis();
+      }
+    }
+      
+
+//    if (!check.cam.isOn) {  
 //      check.cam.isOn=true;
 //      digitalWrite(CAM_PIN,HIGH);
-//    } else if(additData.volt < check.cam.minVoltage*1000){
+//    } else{
 //      check.cam.isOn=false;
 //      digitalWrite(CAM_PIN,LOW);
 //    }
-    if (!check.cam.isOn) { 
-      check.cam.isOn=true;
-      digitalWrite(CAM_PIN,HIGH);
-    } else{
-      check.cam.isOn=false;
-      digitalWrite(CAM_PIN,LOW);
-    }
+    digitalWrite(CAM_PIN, check.cam.isOn);
     additData.flags=changeBit(additData.flags,check.cam.flagpos,check.cam.isOn);
   }
 
@@ -781,6 +806,7 @@ void loop() {
   if (millis() - check.SMS.last> check.SMS.timeout) {
     sendSMS(Serial2);
   }
+  
   if(check.LoRa.OK && check.LoRa.busy){
     checkSent();}
   if(millis() - check.LoRa.last > check.LoRa.timeout){
