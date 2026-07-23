@@ -1,16 +1,16 @@
-#include "FS.h"
-#include "SD.h"
-#include "GY521.h"
+#include <FS.h>
+#include <SD.h>
 #include <SPI.h>
-#include <LoRa.h>
-#include <WiFi.h>
-#include <TinyGPSPlus.h>
-#include <BMP280.h>
-#include <Adafruit_AHTX0.h>
 #include <Wire.h>
-#include <esp_task_wdt.h>
+#include <WiFi.h>
+#include <LoRa.h>
+#include <BMP280.h>
+#include <GY521.h>
+#include <Adafruit_AHTX0.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_HMC5883_U.h>
+#include <TinyGPSPlus.h>
+#include <esp_task_wdt.h>
 #include "RS-FEC.h"
 
 #define CS_PIN    4
@@ -624,7 +624,7 @@ void setup() {
   check.LoRa.timeout=0;
   check.SMS.timeout=5000;
   check.GPS.timeout=5000;
-  check.pms.timeout=5000;
+  check.pms.timeout=10000;
   check.AHT.timeout=1000;
   check.BMP.timeout=1000;
   check.gyro.timeout=1000;
@@ -660,13 +660,13 @@ void setup() {
   
   check.termo.targetTemp =    1;
   check.termo.tempThreshold = 1;
-  check.termo.minVoltage =    3.041;
-  check.termo.voltThreshold = 0.0869;
+  check.termo.minVoltage =    2.844;
+  check.termo.voltThreshold = 0.117;
   check.termo.timeout =       100;
   
   
-  check.cam.minVoltage =    3.041;
-  check.cam.voltThreshold = 0.0556;
+  check.cam.minVoltage =    2.844;
+  check.cam.voltThreshold = 0.085;
   check.cam.targetTemp =    50;
   check.cam.tempThreshold = 10;
   check.cam.timeout =       1*1000*60;
@@ -771,15 +771,6 @@ void loop() {
         check.cam.lastSwitch=millis();
       }
     }
-      
-
-//    if (!check.cam.isOn) {  
-//      check.cam.isOn=true;
-//      digitalWrite(CAM_PIN,HIGH);
-//    } else{
-//      check.cam.isOn=false;
-//      digitalWrite(CAM_PIN,LOW);
-//    }
     digitalWrite(CAM_PIN, check.cam.isOn);
     additData.flags=changeBit(additData.flags,check.cam.flagpos,check.cam.isOn);
   }
