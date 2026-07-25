@@ -179,10 +179,12 @@ calibrationInfo calibrator;
 SystemInfo check;
 
 char row[2048];
+char frow[2048];
 uint8_t pmsBuffer[32];
 
-//const char* number = "+359892777567";
-const char* number = "+359877914275";
+const char* number = "+359892777567"; //niokolay
+//const char* number = "+359877914275"; //yaroslav
+//const char* number = "+359877630942"; //aya
 
 uint8_t changeBit(uint8_t flags,uint8_t flagpos,bool valu){
   return (flags & ~(1 << flagpos)) | (uint8_t(valu) << flagpos);
@@ -196,14 +198,14 @@ void generatePayload(sender<T, parity> &Sender);
 
 template<typename T,uint8_t parity>
 void generatePayload(sender<T, parity> &Sender){
-  
+  T localData = *Sender.sentData;
   uint8_t inputWorkBuffer[Sender.dataLen];
   
   // 2. Clear the buffer safely
   memset(inputWorkBuffer, 0, Sender.dataLen);
   
   // 3. Copy the raw data from your struct pointer (*sentData) into the working buffer
-  memcpy(inputWorkBuffer, Sender.sentData, Sender.dataLen);
+  memcpy(inputWorkBuffer, &localData, Sender.dataLen);
 
   // 4. Encode using the Reed-Solomon instance inside that specific sender.
   // This calculates the error-correction parity bytes and writes everything into Sender.payload
@@ -334,6 +336,9 @@ void dataToCsv(ScientificData allData, TechnicalData additData, char buffer[], i
 }
 
 void sdConnect(){
+  
+  digitalWrite(CS_PIN, HIGH);
+  delay(1);
   check.SD.OK=SD.begin(SD_CS);
   additData.flags=changeBit(additData.flags,check.SD.flagpos,check.SD.OK);
   if(check.SD.OK){
@@ -346,7 +351,8 @@ void sdConnect(){
           if(i<sizeof(labels)/sizeof(labels[0])-1)file.print(",");
           else file.print("\n");
         }
-        file.close();}
+        file.close();
+        delayMicroseconds(100); }
     }
   }
 }
@@ -355,6 +361,8 @@ void sdConnect(){
 // ИСПРАВЛЕНО: LoRaConnect и LoRaCheck
 // -------------------------------------------------------------
 uint8_t readRegister(uint8_t address) {
+  digitalWrite(SD_CS, HIGH); 
+  delay(1);
   digitalWrite(CS_PIN, LOW);
   SPI.transfer(address & 0x7F);
   uint8_t value = SPI.transfer(0);
@@ -362,6 +370,8 @@ uint8_t readRegister(uint8_t address) {
   return value;
 }
 void writeRegister(uint8_t address, uint8_t value) {
+  digitalWrite(SD_CS, HIGH); 
+  delay(1);
   digitalWrite(CS_PIN, LOW);
   SPI.transfer(address | 0x80);
   SPI.transfer(value);
@@ -369,12 +379,14 @@ void writeRegister(uint8_t address, uint8_t value) {
 }
 void LoRaConnect(){
   digitalWrite(CS_PIN, HIGH); // Гарантируем отключение SPI-устройства перед сбросом
+  delay(1);
   
   digitalWrite(RST, LOW);
   delay(10);
   digitalWrite(RST, HIGH);
   delay(10); // ВАЖНО: Даем время LoRa-модулю на аппаратную инициализацию
-  
+  digitalWrite(SD_CS, HIGH);
+  delay(1);
   check.LoRa.OK = LoRa.begin(433E6);
   additData.flags=changeBit(additData.flags,check.LoRa.flagpos,check.LoRa.OK);
   
@@ -406,6 +418,7 @@ void LoRaCheck(){
   
   // ВАЖНО: Отключаем SD-карту от шины перед ручной проверкой LoRa
   digitalWrite(SD_CS, HIGH); 
+  delay(1);
   
   // Start SPI manual transaction
   SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
@@ -427,7 +440,7 @@ void LoRaCheck(){
 bool checkSent() {
   uint8_t irqFlags = 0;
   digitalWrite(SD_CS, HIGH); 
-
+  delay(1);
   SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
   digitalWrite(CS_PIN, LOW);
   SPI.transfer(0x12 & 0x7F);
@@ -443,6 +456,8 @@ bool checkSent() {
 
   // Если пакет ушел (бит 3 установлен)
   if (irqFlags & 0x08) {
+    digitalWrite(SD_CS, HIGH);
+  delay(1);
     SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
     digitalWrite(CS_PIN, LOW);
     SPI.transfer(0x12 | 0x80);
@@ -622,7 +637,7 @@ void setup() {
 
   LoRa.setPins(CS_PIN, RST, DIO0);
   check.LoRa.timeout=0;
-  check.SMS.timeout=5000;
+  check.SMS.timeout=10000;
   check.GPS.timeout=5000;
   check.pms.timeout=10000;
   check.AHT.timeout=1000;
@@ -639,17 +654,24 @@ void setup() {
   check.gyro.flagpos=6;
   check.cam.flagpos=7;
   
-  calibrator.gyro.x.offset=  2.336;
-  calibrator.gyro.y.offset=  2.351;
-  calibrator.gyro.z.offset= -0.221;
-  calibrator.accel.x.offset= 0.035378469830884045;
-  calibrator.accel.x.scale=  10.01711296392382;
-  calibrator.accel.y.offset= -0.010919070720751357;
-  calibrator.accel.y.scale=   9.854182783125843;
-  calibrator.accel.z.offset= -0.0060115734257293755;
-  calibrator.accel.z.scale=   9.569241972040562;
-  calibrator.gtemp.offset=    21.892719725589476;
-  calibrator.gtemp.scale=     0.8899545931264473;
+  calibrator.gyro.x.offset=2.229;
+  calibrator.gyro.y.offset=1.832;
+  calibrator.gyro.z.offset=-0.282;
+  calibrator.gtemp.offset=21.632001263971162;
+  calibrator.gtemp.scale=0.8689763909278867;
+
+  calibrator.accel.x.offset=0.023518088987936236;
+  calibrator.accel.x.scale=9.828255306752146;
+  calibrator.accel.y.offset=0.012319406354065466;
+  calibrator.accel.y.scale=9.82340572943354;
+  calibrator.accel.z.offset=0.015437920660176891;
+  calibrator.accel.z.scale=9.778492686037119;
+  calibrator.mag.x.offset=3.316953075790666;
+  calibrator.mag.x.scale=0.957457935732525;
+  calibrator.mag.y.offset=2.9131900581470713;
+  calibrator.mag.y.scale=1.0142570276226346;
+  calibrator.mag.z.offset=0.02653066184906177;
+  calibrator.mag.z.scale=1.031327271636603;
 
   calibrator.volt.scale=  3.10/4095;
   calibrator.volt.offset=-0.97*4095/3.10;
@@ -723,7 +745,6 @@ void loop() {
   else if (millis()-check.BMP.last>check.BMP.timeout){
     bmpConnect();
   }
-  
   if(check.mag.OK){
       sensors_event_t event; 
       if (mag.getEvent(&event)) {
@@ -776,14 +797,17 @@ void loop() {
   }
 
       
-  dataToCsv(allData,additData,row,sizeof(row));
-  
+  dataToCsv(allData,additData,frow,sizeof(frow));
+  digitalWrite(CS_PIN, HIGH);
+  delay(1);
+
   if(check.SD.OK){
     File file = SD.open("/allData.csv", FILE_APPEND);
     if (file) {
       check.SD.last=millis();
-      file.print(row);
+      file.print(frow);
       file.close();
+      delayMicroseconds(100); 
       check.SD.last=millis();
     }else{
       check.SD.OK=false;
@@ -794,7 +818,7 @@ void loop() {
   dataToJson(allData,additData,row,sizeof(row));
   Serial.print(row);
   
-  if (millis() - check.SMS.last> check.SMS.timeout) {
+  if (millis() - check.SMS.last> check.SMS.timeout && allData.altitude<3000) {
     sendSMS(Serial2);
   }
   
@@ -813,11 +837,15 @@ void loop() {
         generatePayload(additSender);
         check.LoRa.timeout=additSender.timeout;
         Serial.println();
+        digitalWrite(SD_CS, HIGH);
+  delay(1);
         LoRa.beginPacket();
         LoRa.write(additSender.payload, additSender.par+additSender.dataLen+1);
         
       for(int i=0;i<additSender.dataLen + additSender.par+1;i++){
       Serial.printf("%02X", additSender.payload[i]);}
+        digitalWrite(SD_CS, HIGH);
+  delay(1);
         LoRa.endPacket(true);
       }else if(sciSender.quenue>=sciSender.maxQuenue)
       {
@@ -827,7 +855,8 @@ void loop() {
         check.LoRa.timeout=sciSender.timeout;
         
         Serial.println();
-        
+        digitalWrite(SD_CS, HIGH);
+  delay(1);
         LoRa.beginPacket();
         LoRa.write(sciSender.payload, sciSender.par+sciSender.dataLen+1);
         LoRa.endPacket(true); 
@@ -842,8 +871,8 @@ void loop() {
       LoRaConnect();
     }
     check.LoRa.last=millis();
+    delay(10);
   }
-  
   
   esp_task_wdt_reset();
 }
